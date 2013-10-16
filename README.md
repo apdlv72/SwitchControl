@@ -15,6 +15,13 @@ To test the connection, the uC sends a ping command to a remote IP and awaits th
 in a timely fashion. 
 
 The sketch will accept adminitrator commands on the serial port (thus on bluetooth) to
-modify the target IP, the timeout and the retry count and store them opermanantly in EEProm.
+modify the target IP, the timeout and the retry count and store them opermanantly in EEProm:
 
+	I=10.2.0.1 - set ping IP
+	T=4        - set timouet (s)
+	R=10       - set retries
+	P=1|0      - pause on/off
+	M=1|2      - mode (1 ping, 2 dhcp)
+	C          - show config
+	H          - show help
 

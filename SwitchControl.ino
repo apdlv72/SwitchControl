@@ -31,12 +31,17 @@ int errors = 0;
 
 const uint16_t MAGIC = 4711;
 
+uint8_t MODE_PING = 1;
+uint8_t MODE_DHCP = 2;
+
+
 typedef struct  
 {
   uint16_t magic;
-  byte ping_ip[4];
-  int retries;
-  int timeout;
+  byte     ping_ip[4];
+  int      retries;
+  int      timeout;
+  uint8_t  mode;
 } 
 s_config;
 
@@ -46,7 +51,8 @@ const s_config config_default =
   magic   :  MAGIC,
   ping_ip : { 10, 2, 0, 1 },
   retries : 4,
-  timeout : 4
+  timeout : 4,
+  mode    : 1
 };
 
 s_config config = config_default;
@@ -110,6 +116,7 @@ static boolean showHelp()
   PPRINT("H: T=4        - set timouet (s)\r\n");
   PPRINT("H: R=10       - set retries\r\n");
   PPRINT("H: P=1|0      - pause on/off\r\n");
+  PPRINT("H: M=1|2      - mode (1 ping, 2 dhcp)\r\n");
   PPRINT("H: C          - show config\r\n");
   PPRINT("H: H          - show help\r\n");
   return true;
@@ -188,6 +195,15 @@ static void handleCommand()
         config.retries = r;
       }
     }
+    else if ('M'==first)
+    {
+      int m;
+      int n = sscanf(arg, "%i", &m);
+      if ((valid=(1==n)))
+      {
+        config.mode = m;
+      }
+    }
 
     if (valid)
     {
@@ -214,7 +230,13 @@ void eepromWrite(byte * src, byte * addr, uint16_t len)
 {
   for (uint16_t i=0; i<len; i++, addr++, src++)
   {
-    eeprom_write_byte((unsigned char *) addr, *src);
+    byte target = *src;
+    byte currnt = eeprom_read_byte(addr);
+    // avoid unneccessary write cycles (limited to 100k)
+    if (target!=currnt)
+    {
+      eeprom_write_byte((unsigned char *) addr, target);
+    }
   }
 }
 
@@ -233,6 +255,7 @@ boolean configDump()
   Serial.print(config.ping_ip[3]); PPRINT("\r\n");
   PPRINT("C: timeout: "); Serial.print(config.timeout); PPRINT("\r\n");
   PPRINT("C: retries: "); Serial.print(config.retries); PPRINT("\r\n");
+  PPRINT("C: mode:    "); Serial.print(config.mode);    PPRINT("\r\n");
   return true;
 }
 
@@ -277,7 +300,7 @@ void setupEther()
 {
   // start Ethernet
   digitalWrite(PIN_LED, HIGH);
-  PPRINT("I: Sending DHCP request....\r\n");
+  PPRINT("SETUP: Sending DHCP request....\r\n");
   while (Ethernet.begin(mac) == 0) 
   {
     // no point in carrying on, so do nothing forevermore:
@@ -290,12 +313,12 @@ void setupEther()
         mydelay(100);
       }
       
-      PPRINT("I: Resending DHCP request....\r\n");
+      PPRINT("SETUP: Resending DHCP request....\r\n");
     }
   }
 
   // print your local IP address:
-  PPRINT("I: Got IP address: ");
+  PPRINT("SETUP: IP: ");
   for (byte thisByte = 0; thisByte < 4; thisByte++) 
   {
     // print the value of each byte of the IP address:
@@ -306,6 +329,7 @@ void setupEther()
 
   digitalWrite(PIN_LED, LOW);
 }
+
 
 void setup() 
 {
@@ -318,6 +342,36 @@ void setup()
 
   configLoad();
   setupEther();
+}
+
+
+boolean checkConnection()
+{
+  boolean success = false;
+  if (MODE_PING==config.mode)
+  {
+      PPRINT("T: Sending PING request\r\n");
+      ICMPPing ping(pingSocket);
+      success = ping(timeout, config.ping_ip, buffer);
+      PPRINT("T: PING: "); Serial.print(buffer); PPRINT("\r\n");
+  }
+  else     
+  {
+      PPRINT("T: Sending DHCP request\r\n");
+      success = (Ethernet.begin(mac) == 0) ? false : true;
+      if (success)
+      {
+        PPRINT("T: DHCP: "); 
+        for (byte b = 0; b < 4; b++) 
+        {
+          // print the value of each byte of the IP address:
+          Serial.print(Ethernet.localIP()[b], DEC);
+          PPRINT("."); 
+        }
+        PPRINT("\r\n");
+      }
+  }
+  return success;
 }
 
 
@@ -334,16 +388,17 @@ void loop()
     return;
   }
 
-  ICMPPing ping(pingSocket);
+  boolean success = checkConnection();
   
-  boolean success = ping(timeout, config.ping_ip, buffer);
-  PPRINT("I: "); Serial.print(buffer); PPRINT("\r\n");
+//  ICMPPing ping(pingSocket);  
+//  boolean success = ping(timeout, config.ping_ip, buffer);
+//  PPRINT("I: "); Serial.print(buffer); PPRINT("\r\n");
 
   if (!success)
   {
     errors++;
     if (errors>1000) errors=1000; // prevents from overflow
-    PPRINT("I: ping failed, errors: "); Serial.print(errors); PPRINT("\r\n");
+    PPRINT("E: test failed, errors: "); Serial.print(errors); PPRINT("\r\n");
   }
   else
   {
@@ -369,7 +424,11 @@ void loop()
       mydelay(2000);
       digitalWrite(PIN_RELAY, HIGH);
       wasReset = true;
-      setupEther();
+      
+      if (config.mode!=MODE_DHCP)
+      {
+        setupEther();
+      }
     }
     mydelay(500);
   }
