@@ -1,7 +1,7 @@
 /*
  Copyright (C) Artur Pogoda de la Vega
  Arduino sketch to send DHCP requests to a remote IP and reset a device (e.g. swicth) if that fails too often.
- An interval can be defined (business hours, e.g. 9:00 to 17:00) when there shoud be no automatic reset.
+ An interval can be defined (office hours, e.g. 9:00 to 17:00) when there shoud be no automatic reset.
  Time is synchronized from an NTP server.
  Circuit: Relay attached to pin 12
  */
@@ -28,7 +28,8 @@ static const unsigned int localPort = 2390;
 static const s_config DEFAULT_CONFIG =
 {
   magic          : MAGIC,
-  mac            : { 0xC0, 0xFF, 0xEE, 0xC0, 0xFF, 0xEE}, // coffee, coffee
+  // coffee, coffee. 2nd coffee will be overwritten with randoms on 1st time power on.
+  mac            : { 0xC0, 0xFF, 0xEE, 0xC0, 0xFF, 0xEE}, 
   mode           : MODE_DHCP,
   retries        :  3,
   timeout        :  4,
@@ -37,9 +38,9 @@ static const s_config DEFAULT_CONFIG =
   timeServer     : { 10, 2, 0, 1 },
   fetchTime      : true,
   timezone       :  2,
-  businessStart  :  9,
-  businessEnd    : 19,
-  businessEndFr  : 17
+  officeStart    :  9,
+  officeEnd      : 19,
+  officeEndFr    : 17
 };
 
 static const int NTP_PACKET_SIZE =  48; // NTP time stamp is in the first 48 bytes of the message
@@ -128,22 +129,23 @@ char toUpper(char c)
 static boolean showHelp()
 {
   PPRINTLN(
-    "H:I=ip  ping IP\r\n"
-    "H:J=mac mac addr\r\n"
-    "H:N=ip  timeserver IP\r\n"
-    "H:F=1|0 fetch time|don't\r\n"
-    "H:T=4   timeout\r\n"
-    "H:W=10  wait time between checks\r\n"
-    "H:Z=2   timezone\r\n"
-    "H:R=10  retries\r\n"
-    "H:P=1|0 pause on|off\r\n"
-    "H:M=1|2 ping|dhcp mode\r\n"
-    "H:S     business start hour\r\n"
-    "H:E     set business end\r\n"
-    "H:Y     same for fridays\r\n"
-    "H:C     show config\r\n"
-    "H:X     reset uC\r\n"
-    "H:H     help");
+    "H:I=ip   ping IP\r\n"
+    "H:J=mac  mac addr\r\n"
+    "H:N=ip   timeserver IP\r\n"
+    "H:F=1|0  fetch time|don't\r\n"
+    "H:T=4    timeout\r\n"
+    "H:W=10   wait time between checks\r\n"
+    "H:Z=2    timezone\r\n"
+    "H:R=10   retries\r\n"
+    "H:P=1|0  pause on|off\r\n"
+    "H:M=1|2  ping|dhcp mode\r\n"
+    "H:S      office start hour\r\n"
+    "H:E      set office end\r\n"
+    "H:Y      same for fridays\r\n"
+    "H:C      show config\r\n"
+    "H:B=4711 reboot µC\r\n"
+    "H:X=4711 factory reset µC\r\n"
+    "H:H      help");
   return true;
 }
 
@@ -222,12 +224,6 @@ static void handleCommand()
     {
       valid = showHelp();
     }
-    else if ('X'==first)
-    {
-      PPRINTLN("I:*REBOOT*\r\n");
-      delay(500);
-      asm volatile ("jmp 0");
-    }
     else if ('C'==first)
     {
       valid = configDump();
@@ -299,7 +295,7 @@ static void handleCommand()
     {
       if ((valid=parseInt(arg, i, 0, 24)))
       {
-        config.businessStart = i;
+        config.officeStart = i;
         save = true;
       }
     }
@@ -307,7 +303,7 @@ static void handleCommand()
     {
       if ((valid=parseInt(arg, i, 0, 24)))
       {
-        config.businessEnd = i;
+        config.officeEnd = i;
         save = true;
       }
     }
@@ -315,7 +311,7 @@ static void handleCommand()
     {
       if ((valid=parseInt(arg, i, 0, 24)))
       {
-        config.businessEndFr = i;
+        config.officeEndFr = i;
         save = true;
       }
     }
@@ -335,6 +331,25 @@ static void handleCommand()
         save = true;
       }
     }
+    else if ('X'==first || 'B'==first)
+    {
+        // argument "4711" deals as a confirmation against accidental reset/reboot
+      if ((valid=parseInt(arg, i, 4711, 4711)))
+      {
+        if ('X'==first)
+        {
+          // save with invalid magic
+          configSave(config.magic+1);      
+          PPRINTLN("I:*RESET*\r\n");      
+        }
+        else
+        {
+          PPRINTLN("I:*REBOOT*\r\n");
+        }
+        delay(500);
+        asm volatile ("jmp 0");
+      }
+    }
 
     PPRINT("CMD:");
     if (valid)
@@ -348,7 +363,7 @@ static void handleCommand()
     
     if (save)
     {
-      configSave();
+      configSave(MAGIC);
     }
 
     inputClear();
@@ -389,7 +404,7 @@ static boolean configDump()
   PPRINT("C:timeServer:"); dumpIP(config.timeServer); println();
   PPRINT("C:fetchTime: "); Serial.print(config.fetchTime);  println();;
   PPRINT("C:timezone:  "); Serial.print(config.timezone);   println();;
-  PPRINT("C:business:  "); Serial.print(config.businessStart); PPRINT("-"); Serial.print(config.businessEnd); PPRINT(" (FR: "); Serial.print(config.businessEndFr); PPRINTLN(")");
+  PPRINT("C:office:    "); Serial.print(config.officeStart); PPRINT("-"); Serial.print(config.officeEnd); PPRINT(" (FR: "); Serial.print(config.officeEndFr); PPRINTLN(")");
   return true;
 }
 
@@ -419,9 +434,9 @@ static void configLoad()
   configDump();
 }
 
-static void configSave()
+static void configSave(uint16_t magic)
 {
-  config.magic = MAGIC;
+  config.magic = magic;
   eepromWrite((byte*)&config, 0, sizeof(config));
   PPRINTLN("D:CFG SAVED");
 }
@@ -727,8 +742,8 @@ boolean resetBlocked()
   // no valid time received until now -> do not reset 
   if (!time_loc.valid) return true;
   
-  // before start of business -> allow
-  if (time_loc.hours<config.businessStart) return false;
+  // before start of office -> allow
+  if (time_loc.hours<config.officeStart) return false;
   
   // distinguish different days of a week
   switch (time_loc.dow)
@@ -738,12 +753,12 @@ boolean resetBlocked()
     case DAY_SAT:
       return false;
     case DAY_FRI:
-      // block if before end of business on fridays
-      return (time_loc.hours<config.businessEndFr);
+      // block if before end of office on fridays
+      return (time_loc.hours<config.officeEndFr);
   }
 
-  // block if before end of business on normal days
-  return (time_loc.hours<config.businessEnd);
+  // block if before end of office on normal days
+  return (time_loc.hours<config.officeEnd);
 }
 
 void loop()
@@ -790,7 +805,7 @@ void loop()
     {
       PPRINTLN("E:CONDOWN");
       
-      // if fetching the time was disabled or we are outside business hours, do reset
+      // if fetching the time was disabled or we are outside office hours, do reset
       if (!resetBlocked())
       {
         resetSwitch();

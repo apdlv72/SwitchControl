@@ -30,12 +30,12 @@ typedef struct
   boolean   fetchTime;
   // TZ: +2 = CEST
   int8_t    timezone;
-  // hour when office business starts 
-  uint8_t   businessStart;
+  // hour when office office starts 
+  uint8_t   officeStart;
   // hour when it ends
-  uint8_t   businessEnd;
+  uint8_t   officeEnd;
   // same on fridays
-  uint8_t   businessEndFr; 
+  uint8_t   officeEndFr; 
 } 
 s_config;
 
