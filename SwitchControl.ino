@@ -1,7 +1,9 @@
 /*
- Ping Example 
- This example repeatedly sends ICMP pings and sends the result over the serial port.
- Circuit: * Ethernet shield attached to pins 10, 11, 12, 13 
+ Copyright (C) Artur Pogoda de la Vega
+ Arduino sketch to send DHCP requests to a remote IP and reset a device (e.g. swicth) if that fails too often.
+ An interval can be defined (business hours, e.g. 9:00 to 17:00) when there shoud be no automatic reset.
+ Time is synchronized from an NTP server.
+ Circuit: Relay attached to pin 12
  */
 
 #include "SwitchControl.h"
@@ -14,93 +16,92 @@
 
 #define PPRINT(TEXT)   showPgmString(PSTR(TEXT))
 #define PPRINTLN(TEXT) showPgmStringLn(PSTR(TEXT))
+#define MAX(A,B) ((A)>(B)?(A):(B))
 
-static const uint16_t MAGIC  = 4712;
+static const uint16_t MAGIC    = 4711;
 static const uint8_t PIN_LED   = 13;
 static const uint8_t PIN_RELAY = 12;
 
-//static const uint8_t BUSINESS_START =  9;
-//static const uint8_t BUSINESS_END   = 17;
+// local port to listen for UDP packets
+static const unsigned int localPort = 2390;      
 
-static char      input_buffer[16]= { 0 };         // a string to hold incoming serial data
-static char    * inputPos  = input_buffer;
-static char    * inputEnd  = input_buffer+sizeof(input_buffer)-1;
-boolean          input_complete = false;
+static const s_config DEFAULT_CONFIG =
+{
+  magic          : MAGIC,
+  mac            : { 0xC0, 0xFF, 0xEE, 0xC0, 0xFF, 0xEE}, // coffee, coffee
+  mode           : MODE_DHCP,
+  retries        :  3,
+  timeout        :  4,
+  waitTime       : 15,
+  pingAddr       : { 10, 2, 0, 1 },
+  timeServer     : { 10, 2, 0, 1 },
+  fetchTime      : true,
+  timezone       :  2,
+  businessStart  :  9,
+  businessEnd    : 19,
+  businessEndFr  : 17
+};
 
-// address for ethernet shield (coffee, coffee)
-static byte mac[] = { 0xC0, 0xFF, 0xEE, 0xC0, 0xFF, 0xEE}; 
+static const int NTP_PACKET_SIZE =  48; // NTP time stamp is in the first 48 bytes of the message
+static const int UDP_PACKET_SIZE = 256; // max. length of a UDP packet
+static const int MAX_PACKET_SIZE = MAX(NTP_PACKET_SIZE,UDP_PACKET_SIZE);
+
+// buffer shared for NTP and UDP packets
+static char packetBuffer[MAX_PACKET_SIZE];
+
+// a string to hold incoming serial data (commands)
+static char   input_buffer[22]= { 0 };  // longest cmd: "J=aa.bb.cc.dd.ee.ff\0" (20 characters)
+static char * inputPos  = input_buffer;
+static char * inputEnd  = input_buffer+sizeof(input_buffer)-1;
+boolean       input_complete = false;
 
 static SOCKET pingSocket = 0;
 
-static char udpBuffer [256];
+static boolean wasReset        = false;
+static boolean wasPaused       = false;
+static boolean wasNightlyReset = false;
 
-static boolean   wasReset = false;
-static boolean   paused   = false;
-static int       errors   = 0;
-
-static uint8_t MODE_PING = 1;
-static uint8_t MODE_DHCP = 2;
+static uint16_t errors   = 0;
 
 static s_time time_utc = { valid : false,  updated : 0 };
 static s_time time_loc = { valid : false,  updated : 0 };
 
-//static int timezone = +2; 
+static byte localAddr[4] = { 0, 0, 0, 0};
 
-static boolean dailyReset = false;
+static s_config config = DEFAULT_CONFIG;
 
-const s_config config_default =
-{
-  magic          :  MAGIC,
-  ping_ip        : { 10, 2, 0, 1 },
-  retries        : 3,
-  timeout        : 4,
-  mode           : MODE_DHCP,
-  timeServer     : IPAddress(10, 2, 0, 1),
-  timezone       :  2,
-  business_start :  9,
-  business_end   : 19
-  
-};
-
-s_config config = config_default;
-
-// An EthernetUDP instance to let us send and receive packets over UDP
-unsigned int localPort = 2390;      // local port to listen for UDP packets
-
-const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
-byte      packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets 
-
-
-void inputClear()
+static void inputClear()
 {
   // clear the string:
   *(inputPos=input_buffer) = 0;
   input_complete = false;
 }
 
+static void println()
+{
+  Serial.print("\r\n");
+}
+
 void showPgmStringLn(PGM_P s)
 {
   showPgmString(s);
-  PPRINT("\r\n");
+  println();
 }
 
 void showPgmString (PGM_P s)
 {
-	char c;
-	while ((c = pgm_read_byte(s++)) != 0)
-	{
-		Serial.print(c);
-	}
+  char c;
+  while ((c = pgm_read_byte(s++)) != 0)
+  {
+    Serial.print(c);
+  }
 }
 
 void serialEvent()
 {
-  int a=0;
   while (Serial.available())
   {
-    a=1;
     char c = (char)Serial.read();
-
     if (c=='\n' || c=='\r')
     {
       *inputPos = 0; // strip CR at end for convenience
@@ -118,56 +119,113 @@ void serialEvent()
   }
 }
 
-
 char toUpper(char c)
 {
   if ('a'<=c && c<='z') c='A'+(c-'a');
   return c;
 }
 
-
 static boolean showHelp()
 {
-  PPRINTLN("H: I=10.2.0.1 - set ping IP");
-  PPRINTLN("H: N=10.2.0.1 - set NTP timeserver addr.");
-  PPRINTLN("H: T=4        - set timouet");
-  PPRINTLN("H: Z=4        - set timozone");
-  PPRINTLN("H: R=10       - set retries");
-  PPRINTLN("H: P=1|0      - pause on/off");
-  PPRINTLN("H: M=1|2      - mode (1 ping, 2 dhcp)");
-  PPRINTLN("H: C          - show config");
-  PPRINTLN("H: X          - reset uC");
-  PPRINTLN("H: H          - show help");
+  PPRINTLN(
+    "H:I=ip  ping IP\r\n"
+    "H:J=mac mac addr\r\n"
+    "H:N=ip  timeserver IP\r\n"
+    "H:F=1|0 fetch time|don't\r\n"
+    "H:T=4   timeout\r\n"
+    "H:W=10  wait time between checks\r\n"
+    "H:Z=2   timezone\r\n"
+    "H:R=10  retries\r\n"
+    "H:P=1|0 pause on|off\r\n"
+    "H:M=1|2 ping|dhcp mode\r\n"
+    "H:S     business start hour\r\n"
+    "H:E     set business end\r\n"
+    "H:Y     same for fridays\r\n"
+    "H:C     show config\r\n"
+    "H:X     reset uC\r\n"
+    "H:H     help");
   return true;
+}
+
+static boolean parseInt(const char * str, int &i, int min, int max)
+{
+  if (1==sscanf(str, "%i", &i))
+  {
+    return (min<=i) && (i<=max);
+  }
+  return false;
+}
+
+static boolean parseIP(const char * str, byte addr[4])
+{
+  int a,b,c,d;
+  if (4==sscanf(str, "%i.%i.%i.%i", &a, &b, &c, &d))
+  {
+    addr[0] = a;
+    addr[1] = b;
+    addr[2] = c;
+    addr[3] = d;
+    return true;
+  }
+  return false;
+}
+
+static boolean parseMAC(const char * str, byte addr[6])
+{
+  int a,b,c,d,e,f;
+  if (6==sscanf(str, "%x:%x:%x:%x:%x:%x", &a, &b, &c, &d, &e, &f))
+  {
+    addr[0] = (byte)a;
+    addr[1] = (byte)b;
+    addr[2] = (byte)c;
+    addr[3] = (byte)d;
+    addr[4] = (byte)e;
+    addr[5] = (byte)f;
+    return true;
+  }
+  return false;
+}
+
+uint8_t createRandom()
+{
+  int analogPin = 3;
+  uint8_t res = analogRead(analogPin);
+  for (int i=0; i<8; i++)
+  {
+    res = (res<<1) | (1 & analogRead(analogPin));
+  }    
+  return res;
 }
 
 static void handleCommand()
 {
   if (input_complete)
   {
-//    PPRINT("CMD: "); 
-//    Serial.print((const char*)input_buffer); PPRINT("\r\n");
+    char          first = toUpper(input_buffer[0]);
+    char          delim = input_buffer[1];
+    const char  * arg   = &input_buffer[2];
+    boolean       valid = false;
+    boolean       save  = false;
+    int           i;
 
-    char first = toUpper(input_buffer[0]);
-    char delim = input_buffer[1];
-    char * arg = &input_buffer[2];
-    boolean valid = false;
-
-//    PPRINT("first: "); Serial.print(first);  PPRINT("\r\n");
-//    PPRINT("delim: "); Serial.print(delim);  PPRINT("\r\n");
-//    PPRINT("arg: "); Serial.print(arg);      PPRINT("\r\n");
+    if ('Q'==first)
+    {
+      createRandom();
+    }
 
     if ('\r'==first || '\n'==first)
     {
       // ignore empty lines
       valid = true; 
     }
-    else if ('H'==first)
+    else if ('H'==first || '?'==first)
     {
       valid = showHelp();
     }
     else if ('X'==first)
     {
+      PPRINTLN("I:*REBOOT*\r\n");
+      delay(500);
       asm volatile ("jmp 0");
     }
     else if ('C'==first)
@@ -176,90 +234,128 @@ static void handleCommand()
     }
     else if ('='!=delim)
     {
-      //PPRINT("wrong delimiter\n");
       valid = false;
     }    
     else if ('I'==first)
     {
-      int a,b,c,d;
-      int n = sscanf(arg, "%i.%i.%i.%i", &a, &b, &c, &d);
-      if ((valid=(4==n)))
+      if ((valid=parseIP(arg,config.pingAddr)))
       {
-        config.ping_ip[0] = a;
-        config.ping_ip[1] = b;
-        config.ping_ip[2] = c;
-        config.ping_ip[3] = d;
+        save = true;
+      }
+    }
+    else if ('J'==first)
+    {
+      if ((valid=parseMAC(arg,config.mac)))
+      {
+        save = true;
       }
     }
     else if ('N'==first)
     {
-      int a,b,c,d;
-      int n = sscanf(arg, "%i.%i.%i.%i", &a, &b, &c, &d);
-      if ((valid=(4==n)))
+      if ((valid=parseIP(arg,config.timeServer)))
       {
-        config.timeServer = IPAddress(a,b,c,d);
+        save = true;
+      }
+    }
+    else if ('F'==first)
+    {
+      if ((valid=parseInt(arg, i, 0, 1)))
+      {
+        config.fetchTime = (i==1);
       }
     }
     else if ('P'==first)
     {
-      int p;
-      int n = sscanf(arg, "%i", &p);
-      if ((valid=(1==n)))
+      if ((valid=parseInt(arg, i, 0, 1)))
       {
-        paused = p!=0;
+        wasPaused = (i==1);
       }
     }
     else if ('T'==first)
     {
-      int t;
-      int n = sscanf(arg, "%i", &t);
-      if ((valid=(1==n)))
+      if ((valid=parseInt(arg, i, 1, 60)))
       {
-        config.timeout = t;
+        config.timeout = i;
+        save = true;
+      }
+    }
+    else if ('W'==first)
+    {
+      if ((valid=parseInt(arg, i, 1, 180)))
+      {
+        config.waitTime = i;
+        save = true;
       }
     }
     else if ('Z'==first)
     {
-      int z;
-      int n = sscanf(arg, "%i", &z);
-      if ((valid=(1==n)))
+      if ((valid=parseInt(arg, i, -14, 14)))
       {
-        config.timezone = z;
+        config.timezone = i;
+        save = true;
+      }
+    }
+    else if ('S'==first)
+    {
+      if ((valid=parseInt(arg, i, 0, 24)))
+      {
+        config.businessStart = i;
+        save = true;
+      }
+    }
+    else if ('E'==first)
+    {
+      if ((valid=parseInt(arg, i, 0, 24)))
+      {
+        config.businessEnd = i;
+        save = true;
+      }
+    }
+    else if ('Y'==first)
+    {
+      if ((valid=parseInt(arg, i, 0, 24)))
+      {
+        config.businessEndFr = i;
+        save = true;
       }
     }
     else if ('R'==first)
     {
-      int r;
-      int n = sscanf(arg, "%i", &r);
-      if ((valid=(1==n)))
+      if ((valid=parseInt(arg, i, 1, 100)))
       {
-        config.retries = r;
+        config.retries = i;
+        save = true;
       }
     }
     else if ('M'==first)
     {
-      int m;
-      int n = sscanf(arg, "%i", &m);
-      if ((valid=(1==n)))
+      if ((valid=parseInt(arg, i, 1, 2)))
       {
-        config.mode = m;
+        config.mode = i;
+        save = true;
       }
     }
 
+    PPRINT("CMD:");
     if (valid)
     {
-      configSave();
+      PPRINTLN("OK");
     }
     else
     {
-      PPRINTLN("INVAL CMD");
+      PPRINTLN("INVAL");
+    }
+    
+    if (save)
+    {
+      configSave();
     }
 
     inputClear();
   }
 }
 
-void eepromRead(byte * addr, byte * dest, uint16_t len)
+static void eepromRead(byte * addr, byte * dest, uint16_t len)
 {
   for (uint16_t i=0; i<len; i++, addr++, dest++)
   {
@@ -281,61 +377,56 @@ void eepromWrite(byte * src, byte * addr, uint16_t len)
   }
 }
 
-
-boolean configDump()
+static boolean configDump()
 {
-  PPRINT("C: mac:        "); 
-  for (byte i=0; i<6; i++)
-  {
-    Serial.print(mac[i],16); Serial.print(i==5 ? "\r\n" : ":");
-  }
-
-  PPRINT("C: ping_ip:    "); 
-  Serial.print(config.ping_ip[0]); PPRINT(".");
-  Serial.print(config.ping_ip[1]); PPRINT(".");
-  Serial.print(config.ping_ip[2]); PPRINT(".");
-  Serial.print(config.ping_ip[3]); PPRINTLN("");
-
-  PPRINT("C: timeserver: "); 
-  Serial.print(config.timeServer[0]); PPRINT(".");
-  Serial.print(config.timeServer[1]); PPRINT(".");
-  Serial.print(config.timeServer[2]); PPRINT(".");
-  Serial.print(config.timeServer[3]); PPRINTLN("");
-
-  PPRINT("C: timezone:   "); Serial.print(config.timezone);   PPRINTLN("");
-  PPRINT("C: timeout:    "); Serial.print(config.timeout);    PPRINTLN("");
-  PPRINT("C: retries:    "); Serial.print(config.retries);    PPRINTLN("");
-  PPRINT("C: mode:       "); Serial.print(config.mode);       PPRINTLN("");
-  PPRINT("C: business:   "); Serial.print(config.business_start); PPRINT(" - "); Serial.print(config.business_end); PPRINTLN("");
+  PPRINT("C:localAddr: "); dumpIP(localAddr);         println();
+  PPRINT("C:mac:       "); dumpMac(config.mac); println();
+  PPRINT("C:mode:      "); Serial.print(config.mode);       println();;
+  PPRINT("C:timeout:   "); Serial.print(config.timeout);    println();;
+  PPRINT("C:waitTime:  "); Serial.print(config.waitTime);   println();;
+  PPRINT("C:retries:   "); Serial.print(config.retries);    println();;
+  PPRINT("C:pingAddr:  "); dumpIP(config.pingAddr);   println();
+  PPRINT("C:timeServer:"); dumpIP(config.timeServer); println();
+  PPRINT("C:fetchTime: "); Serial.print(config.fetchTime);  println();;
+  PPRINT("C:timezone:  "); Serial.print(config.timezone);   println();;
+  PPRINT("C:business:  "); Serial.print(config.businessStart); PPRINT("-"); Serial.print(config.businessEnd); PPRINT(" (FR: "); Serial.print(config.businessEndFr); PPRINTLN(")");
   return true;
 }
 
-void configLoad()
+static void configLoad()
 {
   eepromRead(0, (byte*)&config, sizeof(config));
   if (config.magic!=MAGIC)
   {
-    //PPRINTLN("I: Magic invalid, performing 1st time init:");
-    config = config_default;
+    config = DEFAULT_CONFIG;
+    
+    // fill the last 3 octets of the mac with random values
+    for (uint8_t i=3; i<6; i++)
+    {
+      for (uint8_t trial=0; trial<10; trial++)
+      {
+        uint8_t r = createRandom();        
+        if (r>0) 
+        {
+          config.mac[i]=r;
+          break;
+        }
+      }
+    }
+    
     eepromWrite((byte*)&config, 0, sizeof(config));
-  }
-  else
-  {
-    //PPRINTLN("I: Magic valid, config loaded:");
   }
   configDump();
 }
 
-
-void configSave()
+static void configSave()
 {
   config.magic = MAGIC;
   eepromWrite((byte*)&config, 0, sizeof(config));
-  PPRINTLN("D: config saved");
+  PPRINTLN("D:CFG SAVED");
 }
 
-
-void mydelay(long ms)
+static void mydelay(long ms)
 {
   long end = millis()+ms;
   do 
@@ -347,139 +438,165 @@ void mydelay(long ms)
   while (millis()<end);
 }
 
-
 // send an NTP request to the time server at the given address 
-unsigned long sendNTPpacket(EthernetUDP& Udp, IPAddress& address)
+//static unsigned long sendNTPpacket(EthernetUDP& Udp, IPAddress& address)
+static void sendNTPpacket(EthernetUDP& Udp, byte address[4])
 {
-  //Serial.println("1");
   // set all bytes in the buffer to 0
   memset(packetBuffer, 0, NTP_PACKET_SIZE); 
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  //Serial.println("2");
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49; 
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-  
-  //Serial.println("3");
 
+  // Initialize values needed to form NTP request(see URL above for details on the packets)
+  packetBuffer[ 0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[ 1] = 0;     // Stratum, or type of clock
+  packetBuffer[ 2] = 6;     // Polling Interval
+  packetBuffer[ 3] = 0xEC;  // Peer Clock Precision
+
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12] = 49; 
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  
   // all NTP fields have been given values, now
   // you can send a packet requesting a timestamp:         
-  Udp.beginPacket(address, 123); //NTP requests are to port 123
-  //Serial.println("4");
-  Udp.write(packetBuffer,NTP_PACKET_SIZE);
-  //Serial.println("5");
-  Udp.endPacket(); 
-  //Serial.println("6");
-  return 0;
+  Udp.beginPacket(address, 123); // NTP requests are to port 123
+  Udp.write((byte*)packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();   
+  //return 0;
 }
 
+void dumpIP(byte addr[4])
+{
+  for (byte i=0; i<4; i++) 
+  {
+    Serial.print(addr[i], DEC);
+    if (i<3) PPRINT("."); 
+  }
+}
+
+void dumpMac(byte addr[6])
+{
+  for (byte i=0; i<6; i++) 
+  {
+    byte b = addr[i];
+    if (b<=0x0f) PPRINT("0");
+    Serial.print(addr[i], HEX);
+    if (i<5) PPRINT(":"); 
+  }
+}
 
 void setupEther()
 {
   // start Ethernet
   digitalWrite(PIN_LED, HIGH);
-  PPRINTLN("SETUP: Request IP ..");
-  while (Ethernet.begin(mac) == 0) 
+
+  int rc;
+  do
   {
-    // no point in carrying on, so do nothing forevermore:
-    PPRINTLN("E: DHCP failed");
-    for (int i=0; i<20; i++)
+    PPRINTLN("S:DHCP?");
+    rc = Ethernet.begin(config.mac);
+    if (0==rc) 
     {
-      digitalWrite(PIN_LED, i%2);
-      mydelay(100);
+      // no point in carrying on, so do nothing forevermore:
+      PPRINTLN("E:DHCP");
+      for (int i=0; i<20; i++)
+      {
+        digitalWrite(PIN_LED, i%2);
+        mydelay(100);
+      }
     }
-    
-    PPRINTLN("SETUP: Retry DHCP..");
   }
+  while (0==rc);
 
   // print your local IP address:
-  PPRINT("SETUP: IP: ");
-  for (byte thisByte = 0; thisByte < 4; thisByte++) 
+  PPRINT("S:DHCP: ");
+  for (byte i = 0; i < 4; i++) 
   {
-    // print the value of each byte of the IP address:
-    Serial.print(Ethernet.localIP()[thisByte], DEC);
-    PPRINT("."); 
+    localAddr[i] = Ethernet.localIP()[i];
   }
-  PPRINTLN("");
+  dumpIP(localAddr);
+  println();
 
   digitalWrite(PIN_LED, LOW);
 }
 
-void dumpDayOfWeek(int dow)
+static void dumpDayOfWeek(int dow)
 {  
   switch(dow)
   {
-    case 0 : PPRINT("Su"); return;
-    case 1 : PPRINT("Mo"); return;
-    case 2 : PPRINT("Tu"); return;
-    case 3 : PPRINT("We"); return;
-    case 4 : PPRINT("Th"); return;
-    case 5 : PPRINT("Fr"); return;
-    case 6 : PPRINT("Sa"); return;
+    case 0 : PPRINT("SU"); return;
+    case 1 : PPRINT("MO"); return;
+    case 2 : PPRINT("TU"); return;
+    case 3 : PPRINT("WE"); return;
+    case 4 : PPRINT("TH"); return;
+    case 5 : PPRINT("FR"); return;
+    case 6 : PPRINT("SA"); return;
   }
+}
+
+void print00(uint8_t h)
+{
+  Serial.print(h<10 ? 0 : h/10); Serial.print(h%10);
 }
 
 void timeDump(s_time & t)
 {
-    int h = t.hours;
-    int m = t.minutes;
-    int s = t.seconds;    
-    dumpDayOfWeek(t.dow); 
-    PPRINT(", ");
-    Serial.print(h<10 ? 0 : h/10); Serial.print(h%10); PPRINT(":");
-    Serial.print(m<10 ? 0 : m/10); Serial.print(m%10); PPRINT(":");
-    Serial.print(s<10 ? 0 : s/10); Serial.print(s%10); 
+  if (!t.valid)
+  {
+    //PPRINT("?");
+    return;
+  }
+  uint8_t h = t.hours;
+  uint8_t m = t.minutes;
+  uint8_t s = t.seconds;    
+  PPRINT("["); dumpDayOfWeek(t.dow); PPRINT(" "); print00(h); PPRINT(":"); print00(m); PPRINT(":"); print00(s); PPRINT("]");
 }
 
-void epochToHMS(unsigned long epoch, s_time & t)
+void epochToHMS(unsigned long epoch, s_time &t)
 {
     const long secsPerDay = 86400L;
-    t.dow     = (epoch  / 86400L + 4) % 7;
-    t.hours   = (epoch  % 86400L) / 3600;
+    t.dow     = (epoch  / secsPerDay + 4) % 7;
+    t.hours   = (epoch  % secsPerDay) / 3600;
     t.minutes = (epoch  % 3600) / 60;
-    t.seconds = epoch %60;
+    t.seconds = epoch % 60;
     t.valid   = true;
     t.epoch   = epoch;
     t.updated = millis();
 }
 
-
 void timeUpdate()
 {
+  if (!config.fetchTime) return;
+  
   uint32_t now  = millis();
   uint32_t diff = (now-time_utc.updated)/1000; // seconds
   
-  //PPRINTLN("timeUpdate: diff="); Serial.println(diff);
+//  PPRINT("timeUpdate: diff="); Serial.println(diff);
+//  PPRINT("timeUpdate: updated="); Serial.println(time_utc.updated);
   
-  // current time is valid and less than 60 minutes old
-  if (0==time_utc.updated || diff>(60*60))  
+  boolean valid = time_utc.valid;
+
+  // if we have already a valid time, synchronize ever hour.
+  // if this is the first time call, do update
+  // if not, retry every 10 seconds
+  if ((valid && diff>(60*60)) || (!valid && 0==time_utc.updated) || (!valid && diff>10))  
   {  
-    PPRINTLN("D: Request NTP time");
-    // assume the worst case:  
+    // regardless of whether the request will be successfull or not, set timestamp for the above condition:
     time_utc.updated = millis();
-    time_utc.valid   = false;
-    //PPRINTLN("D: time invalidated");
     
+    PPRINTLN("I:NTP?");    
     EthernetUDP Udp;
     Udp.begin(localPort);
     
-    //PPRINTLN("D: Getting time...");
     sendNTPpacket(Udp, config.timeServer); // send an NTP packet to a time server
-    //PPRINT("D: UDP packet sent\r\n");
+    //PPRINTLN("D:UDP SENT");
     mydelay(1000);
    
-    //PPRINTLN("D: Parsing packet");  
+    //PPRINTLN("D:UDP PARSE");  
     //Serial.println( Udp.parsePacket() );
     if ( Udp.parsePacket() ) 
     { 
-        //PPRINTLN("D: UDP packet received"); 
+        //PPRINTLN("D:UDP PARSED"); 
         // We've received a packet, read the data from it
         Udp.read(packetBuffer,NTP_PACKET_SIZE);  // read the packet into the buffer
     
@@ -487,163 +604,200 @@ void timeUpdate()
         // or two words, long. First, esxtract the two words:
     
         unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-        unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);  
+        unsigned long lowWord  = word(packetBuffer[42], packetBuffer[43]);  
         // combine the four bytes (two words) into a long integer
         // this is NTP time (seconds since Jan 1 1900):
         unsigned long secsSince1900 = highWord << 16 | lowWord;  
         //PPRINT("Seconds since Jan 1 1900 = " );
-        Serial.println(secsSince1900);               
+        //Serial.println(secsSince1900);               
     
         // now convert NTP time into everyday time:
         // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
         const unsigned long seventyYears = 2208988800UL;     
         // subtract seventy years: yields unix time
         unsigned long epoch = secsSince1900 - seventyYears;  
-        //PPRINT("unix timestamp: "); Serial.print(epoch); PPRINTLN("");
+        //PPRINT("unix timestamp: "); Serial.print(epoch); println();;
             
+        // this will also set the valid flag:
         epochToHMS(epoch, time_utc);
-        //PPRINT("D: time updated\r\n");        
+        PPRINT("I:NTP:");        
+        timeDump(time_utc);
+        println();
       }
       
-      /* Release any resources being used by this EthernetUDP instance */
+      // eelease any resources being used by this EthernetUDP instance 
       Udp.stop();
-    }
+  }
 
   extrapolateTime();
   return;
 }
 
-
 void extrapolateTime()
 {
+  if (!time_utc.valid) 
+  {
+    return;
+  }
+
   uint32_t now  = millis();
-  uint32_t diff = (now-time_utc.updated)/1000; // seconds
+  uint32_t last = time_utc.updated;
+  uint32_t diff; // seconds
+  
+  // handle possible overflow of the 32bit millis counter (after approx. 49 days):
+  if (last>now)
+  {
+    // 42949672950=2^32-1
+    diff = (4294967295L-last)+now; 
+  }
+  else
+  {
+    diff = (now-time_utc.updated);
+  }
+  
+  // convert to seconds:
+  diff/=1000;
   epochToHMS(time_utc.epoch+diff+3600*config.timezone, time_loc);    
 }
 
-void setup() 
-{
-  pinMode(PIN_LED, OUTPUT);
-  pinMode(PIN_RELAY, OUTPUT);
-  digitalWrite(PIN_RELAY, HIGH);
-
-  Serial.begin(9600);
-  PPRINTLN("\r\nI: SwitchControl V0.2");
-
-  configLoad();
-  setupEther();
-}
-
-
-boolean checkConnection()
+static boolean checkConnection()
 {
   boolean success = false;
 
-  PPRINT("T["); timeDump(time_loc); PPRINT("]: ");
+  PPRINT("T"); timeDump(time_loc); PPRINT(":");
   
   if (MODE_PING==config.mode)
   {
       PPRINTLN("PING?");
       ICMPPing ping(pingSocket);
-      success = ping(config.timeout, config.ping_ip, udpBuffer);
+      success = ping(config.timeout, config.pingAddr, packetBuffer);
       
       extrapolateTime();
-      PPRINT("T["); timeDump(time_loc); PPRINT("]: PING: "); Serial.print(udpBuffer); 
+      PPRINT("T"); timeDump(time_loc); PPRINT(":PING:"); Serial.print(packetBuffer); 
   }
   else     
   {
       PPRINTLN("DHCP?");
-      success = (Ethernet.begin(mac) == 0) ? false : true;
+      success = (Ethernet.begin(config.mac) == 0) ? false : true;
       if (success)
       {        
         extrapolateTime();
-        PPRINT("T["); timeDump(time_loc); PPRINT("]: DHCP: ");
+        PPRINT("T"); timeDump(time_loc); PPRINT(":DHCP:");
         
-        for (byte b = 0; b < 4; b++) 
+        for (byte b=0; b<4; b++) 
         {
           // print the value of each byte of the IP address:
           Serial.print(Ethernet.localIP()[b], DEC);
-          Serial.print(3==b ? "" : "."); 
+          if (b<3) PPRINT(".");
         }
       }
   }
   
-  PPRINTLN("");
+  println();;
   return success;
 }
-
 
 void resetSwitch()
 {
   // power off for two seconds
-  PPRINTLN("I: Resetting switch");
+  PPRINTLN("I:RESETTING");
   digitalWrite(PIN_RELAY, LOW);
   mydelay(3000);
   digitalWrite(PIN_RELAY, HIGH);
   wasReset = true;
 }
 
+void setup() 
+{
+  pinMode(PIN_LED,   OUTPUT);
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, HIGH);
+
+  Serial.begin(9600);
+  PPRINTLN("\r\nI:SwitchControl V0.3");
+  configLoad();
+  setupEther();
+}
+
+boolean resetBlocked()
+{
+  // fetching the time was disabled -> always allow
+  if (!config.fetchTime) return false;
+  
+  // no valid time received until now -> do not reset 
+  if (!time_loc.valid) return true;
+  
+  // before start of business -> allow
+  if (time_loc.hours<config.businessStart) return false;
+  
+  // distinguish different days of a week
+  switch (time_loc.dow)
+  {
+    // always allow on weekends
+    case DAY_SUN:
+    case DAY_SAT:
+      return false;
+    case DAY_FRI:
+      // block if before end of business on fridays
+      return (time_loc.hours<config.businessEndFr);
+  }
+
+  // block if before end of business on normal days
+  return (time_loc.hours<config.businessEnd);
+}
+
 void loop()
 {
-  digitalWrite(PIN_LED, HIGH);
-    
+  digitalWrite(PIN_LED, HIGH);    
   timeUpdate(); 
-  //PPRINT("TIME: UTC: "); timeDump(time_utc); PPRINT("\r\n"); 
-  //PPRINT("TIME: "); timeDump(time_loc); PPRINTLN(""); 
   
-  if (paused)
+  if (wasPaused)
   {
     mydelay(100);
     digitalWrite(PIN_LED, LOW);  
-    PPRINTLN("I: Paused");
+    PPRINTLN("I:PAUSED");
     mydelay(100);
     return;
   }
 
-  boolean success = checkConnection();
-  
-//  ICMPPing ping(pingSocket);  
-//  boolean success = ping(timeout, config.ping_ip, buffer);
-//  PPRINT("I: "); Serial.print(buffer); PPRINT("\r\n");
-
+  boolean success = checkConnection();  
   if (!success)
   {
     errors++;
-    if (errors>1000) errors=1000; // prevents from overflow
-    PPRINT("W: failed, "); Serial.print(errors); PPRINTLN(" errors");
+    // avoid overflow:
+    if (errors>1000) errors=1000; 
+    PPRINT("W:ERR "); Serial.print(errors); println();;
   }
   else
   {
-    if (dailyReset)
-    {
-      PPRINTLN("OK: dailyRest=true") ;
-    }
-    else
-    {
-      PPRINTLN("OK:");
-    }
+    uint32_t now = millis();
+    PPRINT("OK:"); Serial.print(now/1000); PPRINT("."); Serial.print(now%1000); 
+    if (wasNightlyReset) PPRINT(" (NIGHTLYRST)");
+    println();
+
     errors = 0;
     if (wasReset)
     {
       wasReset = false;
-      PPRINTLN("I: connection up again!");
+      PPRINTLN("I:CONBACK");
     }
   }
 
   if (errors>=config.retries)
   {
-    PPRINT("W: too many errors ("); Serial.print(errors); PPRINTLN(")");
+    PPRINT("W:ERRLIMIT ("); Serial.print(errors); PPRINTLN(")");
     if (!wasReset)
     {
-      PPRINTLN("E: Connection down ...");
+      PPRINTLN("E:CONDOWN");
       
-      if (time_loc.hours<config.business_start || time_loc.hours>config.business_end)
+      // if fetching the time was disabled or we are outside business hours, do reset
+      if (!resetBlocked())
       {
         resetSwitch();
       }
       else
       {
-        PPRINTLN("W: No reset (still in business hours)");
+        PPRINTLN("W:RSTBLCK");
       }
       
       if (config.mode!=MODE_DHCP)
@@ -654,29 +808,33 @@ void loop()
     mydelay(500);
   }
   
-  if (time_loc.hours<1)
+  if (config.fetchTime && time_loc.valid && time_loc.hours<1 && time_loc.minutes<15)
   {
-    if (!dailyReset)
+    if (!wasNightlyReset)
     {      
-      PPRINTLN("I: Performing daily reset");
+      PPRINTLN("I:NIGHTLYRSTNOW");
       resetSwitch();
-      dailyReset = true;
-      wasReset   = true;
+      wasNightlyReset = true;
     }
   }
   else
   {
-    dailyReset = false;
+    wasNightlyReset = false;
   }
 
+  digitalWrite(PIN_LED, LOW);  
+  
   if (success)
   {
-    digitalWrite(PIN_LED, LOW);  
-    mydelay(5000);
+    // mydelay will handle command, so config.waitTime can change.
+    // this prevent from lockup when user entered too high a value for wait time
+    for (uint16_t w=0; w<config.waitTime;  w++)
+    {
+      mydelay(1000);      
+    }
   }
   else
   {
-    digitalWrite(PIN_LED, LOW);  
     mydelay(1000);
   }
 }
