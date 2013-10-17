@@ -5,12 +5,14 @@
  Time is synchronized from an NTP server.
  Circuit: Relay attached to pin 12
  */
-
+ 
 #include "SwitchControl.h"
 
 #include <SPI.h>         
 #include <Ethernet.h>
 #include <EthernetUdp.h>
+#include <Dhcp.h>
+
 #include <ICMPPing.h>
 #include <avr/eeprom.h>
 
@@ -71,6 +73,12 @@ static byte localAddr[4] = { 0, 0, 0, 0};
 
 static s_config config = DEFAULT_CONFIG;
 
+//unsigned long timeoutDhcp = 60000; // the default (60s)
+const unsigned long   timeoutDhcp =  8000; // shorter (8s)  
+
+static DhcpClass dhcp;
+
+
 static void inputClear()
 {
   // clear the string:
@@ -129,22 +137,24 @@ char toUpper(char c)
 static boolean showHelp()
 {
   PPRINTLN(
-    "H:I=ip   ping IP\r\n"
-    "H:J=mac  mac addr\r\n"
-    "H:N=ip   timeserver IP\r\n"
-    "H:F=1|0  fetch time|don't\r\n"
-    "H:T=4    timeout\r\n"
+    "H:J=mac  own mac addr\r\n"
+    "H:I=ip   remote IP to ping\r\n"
+    "H:N=ip   remote timeserver IP\r\n"
+    "H:F=1|0  do fetch time|don't\r\n"
+    "H:T=4    request timeout\r\n"
     "H:W=10   wait time between checks\r\n"
     "H:Z=2    timezone\r\n"
     "H:R=10   retries\r\n"
     "H:P=1|0  pause on|off\r\n"
     "H:M=1|2  ping|dhcp mode\r\n"
-    "H:S      office start hour\r\n"
-    "H:E      set office end\r\n"
-    "H:Y      same for fridays\r\n"
+    "H:S=9    office start hour\r\n"
+    "H:E=19   set office end\r\n"
+    "H:Y=17   same for fridays\r\n"
     "H:C      show config\r\n"
-    "H:B=4711 reboot µC\r\n"
-    "H:X=4711 factory reset µC\r\n"
+    "H:U      update time now\r\n"
+    "H:B=4711 reboot uC\r\n"
+    "H:X=4711 factory reset uC\r\n"
+    "H:Q=4711 reset switch now\r\n"
     "H:H      help");
   return true;
 }
@@ -203,17 +213,14 @@ static void handleCommand()
 {
   if (input_complete)
   {
-    char          first = toUpper(input_buffer[0]);
-    char          delim = input_buffer[1];
-    const char  * arg   = &input_buffer[2];
-    boolean       valid = false;
-    boolean       save  = false;
+    char          first  = toUpper(input_buffer[0]);
+    char          delim  = input_buffer[1];
+    const char  * arg    = &input_buffer[2];
+    boolean       valid  = false;
+    boolean       save   = false;
+    boolean       update = false;
+    boolean       reset  = false;
     int           i;
-
-    if ('Q'==first)
-    {
-      createRandom();
-    }
 
     if ('\r'==first || '\n'==first)
     {
@@ -227,6 +234,10 @@ static void handleCommand()
     else if ('C'==first)
     {
       valid = configDump();
+    }
+    else if ('U'==first)
+    {
+      valid = update = true;
     }
     else if ('='!=delim)
     {
@@ -269,7 +280,7 @@ static void handleCommand()
     }
     else if ('T'==first)
     {
-      if ((valid=parseInt(arg, i, 1, 60)))
+      if ((valid=parseInt(arg, i, 1, 180)))
       {
         config.timeout = i;
         save = true;
@@ -331,7 +342,7 @@ static void handleCommand()
         save = true;
       }
     }
-    else if ('X'==first || 'B'==first)
+    else if ('X'==first || 'B'==first || 'Q'==first)
     {
         // argument "4711" deals as a confirmation against accidental reset/reboot
       if ((valid=parseInt(arg, i, 4711, 4711)))
@@ -342,31 +353,50 @@ static void handleCommand()
           configSave(config.magic+1);      
           PPRINTLN("I:*RESET*\r\n");      
         }
-        else
+        else if ('B'==first)
         {
           PPRINTLN("I:*REBOOT*\r\n");
         }
-        delay(500);
-        asm volatile ("jmp 0");
+        
+        if ('Q'==first)
+        {
+          reset = true;
+        }
+        else  
+        {
+          // give serial a chance to flush
+          delay(500); 
+          asm volatile ("jmp 0");
+        }
       }
     }
 
-    PPRINT("CMD:");
     if (valid)
     {
-      PPRINTLN("OK");
+      PPRINTLN("CMD:OK");
     }
     else
     {
-      PPRINTLN("INVAL");
+      PPRINTLN("CMD:INVAL");
     }
     
+    inputClear();
+    
+    // make sure we called inputClear, since there may be "mydelay" calls inside 
+    // the following functions which will cause in infinite recursion otherwise
     if (save)
     {
       configSave(MAGIC);
     }
-
-    inputClear();
+    else if (update)
+    {
+      timeUpdate(true);
+    }
+    else if (reset)
+    {
+       resetSwitch();
+    }
+      
   }
 }
 
@@ -443,7 +473,7 @@ static void configSave(uint16_t magic)
 
 static void mydelay(long ms)
 {
-  long end = millis()+ms;
+  uint32_t end = millis()+ms;
   do 
   {
     delay(1);
@@ -500,19 +530,58 @@ void dumpMac(byte addr[6])
   }
 }
 
+/*
+int EthernetClass::begin(uint8_t *mac_address)
+{
+  static DhcpClass s_dhcp;
+  _dhcp = &s_dhcp;
+
+  // Initialise the basic info
+  W5100.init();
+  W5100.setMACAddress(mac_address);
+  W5100.setIPAddress(IPAddress(0,0,0,0).raw_address());
+
+  // Now try to get our config info from a DHCP server
+  int ret = _dhcp->beginWithDHCP(mac_address);
+  if(ret == 1)
+  {
+    // We've successfully found a DHCP server and got our configuration info, so set things
+    // accordingly
+    W5100.setIPAddress(_dhcp->getLocalIp().raw_address());
+    W5100.setGatewayIp(_dhcp->getGatewayIp().raw_address());
+    W5100.setSubnetMask(_dhcp->getSubnetMask().raw_address());
+    _dnsServerAddress = _dhcp->getDnsServerIp();
+  }
+
+  return ret;
+}
+*/
+
+void printMillis(long l)
+{
+  Serial.print(l/1000); PPRINT("."); Serial.print(l%1000); 
+}
+
 void setupEther()
 {
   // start Ethernet
   digitalWrite(PIN_LED, HIGH);
+  IPAddress ip(0, 0, 0, 0);    
 
   int rc;
+  PPRINTLN("S:BEGIN");
+  Ethernet.begin(config.mac, ip);    
+  // for some reason, the very first DHCP request fails reproducibly, thus do one
+  // extra before the actual retry loop below with a very short tiomeout
+  dhcp.beginWithDHCP(config.mac, 100);        
+  
   do
   {
-    PPRINTLN("S:DHCP?");
-    rc = Ethernet.begin(config.mac);
+    PPRINT("S:DHCP?("); printMillis(timeoutDhcp); PPRINTLN(")");
+
+    rc = dhcp.beginWithDHCP(config.mac, timeoutDhcp);        
     if (0==rc) 
     {
-      // no point in carrying on, so do nothing forevermore:
       PPRINTLN("E:DHCP");
       for (int i=0; i<20; i++)
       {
@@ -520,15 +589,18 @@ void setupEther()
         mydelay(100);
       }
     }
+    else
+    {
+      Ethernet.begin(config.mac, dhcp.getLocalIp());    
+    }
   }
   while (0==rc);
+  
+  // savi in global variable
+  memcpy(localAddr, &(dhcp.getLocalIp()[0]), 4);
 
   // print your local IP address:
   PPRINT("S:DHCP: ");
-  for (byte i = 0; i < 4; i++) 
-  {
-    localAddr[i] = Ethernet.localIP()[i];
-  }
   dumpIP(localAddr);
   println();
 
@@ -579,9 +651,9 @@ void epochToHMS(unsigned long epoch, s_time &t)
     t.updated = millis();
 }
 
-void timeUpdate()
+boolean timeUpdate(boolean force)
 {
-  if (!config.fetchTime) return;
+  if (!config.fetchTime) return false;
   
   uint32_t now  = millis();
   uint32_t diff = (now-time_utc.updated)/1000; // seconds
@@ -594,7 +666,7 @@ void timeUpdate()
   // if we have already a valid time, synchronize ever hour.
   // if this is the first time call, do update
   // if not, retry every 10 seconds
-  if ((valid && diff>(60*60)) || (!valid && 0==time_utc.updated) || (!valid && diff>10))  
+  if (force || (valid && diff>(60*60)) || (!valid && 0==time_utc.updated) || (!valid && diff>10))  
   {  
     // regardless of whether the request will be successfull or not, set timestamp for the above condition:
     time_utc.updated = millis();
@@ -645,7 +717,7 @@ void timeUpdate()
   }
 
   extrapolateTime();
-  return;
+  return true;
 }
 
 void extrapolateTime()
@@ -663,7 +735,7 @@ void extrapolateTime()
   if (last>now)
   {
     // 42949672950=2^32-1
-    diff = (4294967295L-last)+now; 
+    diff = (4294967295UL-last)+now; 
   }
   else
   {
@@ -688,12 +760,13 @@ static boolean checkConnection()
       success = ping(config.timeout, config.pingAddr, packetBuffer);
       
       extrapolateTime();
-      PPRINT("T"); timeDump(time_loc); PPRINT(":PING:"); Serial.print(packetBuffer); 
+      PPRINT("T"); timeDump(time_loc); PPRINT(":PING:"); Serial.print(packetBuffer); println();
   }
   else     
   {
-      PPRINTLN("DHCP?");
-      success = (Ethernet.begin(config.mac) == 0) ? false : true;
+      unsigned long to = 1000UL*config.timeout;
+      PPRINT("DHCP?("); printMillis(to); PPRINTLN(")");
+      success = dhcp.beginWithDHCP(config.mac, to)!=0;              
       if (success)
       {        
         extrapolateTime();
@@ -702,13 +775,14 @@ static boolean checkConnection()
         for (byte b=0; b<4; b++) 
         {
           // print the value of each byte of the IP address:
-          Serial.print(Ethernet.localIP()[b], DEC);
+          Serial.print(dhcp.getLocalIp()[b], DEC);
           if (b<3) PPRINT(".");
         }
+        println();
       }
   }
   
-  println();;
+  
   return success;
 }
 
@@ -764,7 +838,7 @@ boolean resetBlocked()
 void loop()
 {
   digitalWrite(PIN_LED, HIGH);    
-  timeUpdate(); 
+  timeUpdate(false); 
   
   if (wasPaused)
   {
@@ -781,12 +855,12 @@ void loop()
     errors++;
     // avoid overflow:
     if (errors>1000) errors=1000; 
-    PPRINT("W:ERR "); Serial.print(errors); println();;
+    PPRINT("FAIL:"); Serial.print(errors); println();;
   }
   else
   {
     uint32_t now = millis();
-    PPRINT("OK:"); Serial.print(now/1000); PPRINT("."); Serial.print(now%1000); 
+    PPRINT("OK:"); printMillis(now); 
     if (wasNightlyReset) PPRINT(" (NIGHTLYRST)");
     println();
 
@@ -800,7 +874,7 @@ void loop()
 
   if (errors>=config.retries)
   {
-    PPRINT("W:ERRLIMIT ("); Serial.print(errors); PPRINTLN(")");
+    PPRINT("W:ERRLIMIT("); Serial.print(errors); PPRINTLN(")");
     if (!wasReset)
     {
       PPRINTLN("E:CONDOWN");
@@ -843,7 +917,7 @@ void loop()
   {
     // mydelay will handle command, so config.waitTime can change.
     // this prevent from lockup when user entered too high a value for wait time
-    for (uint16_t w=0; w<config.waitTime;  w++)
+    for (uint16_t w=0; w<config.waitTime && !wasPaused;  w++)
     {
       mydelay(1000);      
     }
@@ -853,16 +927,6 @@ void loop()
     mydelay(1000);
   }
 }
-
-
-
-
-
-
-
-
-
-
 
 
 

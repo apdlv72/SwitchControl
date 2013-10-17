@@ -4,6 +4,13 @@
 #include <Arduino.h>         
 #include <Ethernet.h>
 
+// Workaround for http://gcc.gnu.org/bugzilla/show_bug.cgi?id=34734
+#ifdef PROGMEM
+#undef PROGMEM
+#define PROGMEM __attribute__((section(".progmem.data")))
+#endif
+
+
 static const uint8_t MODE_PING = 1;
 static const uint8_t MODE_DHCP = 2;
 
