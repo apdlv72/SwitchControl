@@ -4,17 +4,27 @@
 #include <Arduino.h>         
 #include <Ethernet.h>
 
+//#define WITH_PING
+#define WITH_HELP
+//#define WITH_SETMAC
+//#define WITH_RNDMAC
+#define WITH_TZ
+#define WITH_NTP
+
 // Workaround for http://gcc.gnu.org/bugzilla/show_bug.cgi?id=34734
 #ifdef PROGMEM
 #undef PROGMEM
 #define PROGMEM __attribute__((section(".progmem.data")))
 #endif
 
-
+#ifdef WITH_PING
 static const uint8_t MODE_PING = 1;
+#endif
 static const uint8_t MODE_DHCP = 2;
 
-// configuration. everything that goes to EEProm is inside this struct:
+// Configuration. everything that goes to EEProm is inside this struct.
+// Regardless whether any of the WITH_* features have been compiled in, 
+// all settings will always be incldued 
 typedef struct  
 {
   // magic to check whether EEProm was initialized

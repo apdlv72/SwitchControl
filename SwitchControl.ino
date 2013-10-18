@@ -13,7 +13,9 @@
 #include <EthernetUdp.h>
 #include <Dhcp.h>
 
+#ifdef WITH_PING
 #include <ICMPPing.h>
+#endif
 #include <avr/eeprom.h>
 
 #define PPRINT(TEXT)   showPgmString(PSTR(TEXT))
@@ -37,7 +39,7 @@ static const s_config DEFAULT_CONFIG =
   timeout        :  4,
   waitTime       : 15,
   pingAddr       : { 10, 2, 0, 1 },
-  timeServer     : { 10, 2, 0, 1 },
+  timeServer     : { 10, 2, 0, 1 },  
   fetchTime      : true,
   timezone       :  2,
   officeStart    :  9,
@@ -46,11 +48,18 @@ static const s_config DEFAULT_CONFIG =
 };
 
 static const int NTP_PACKET_SIZE =  48; // NTP time stamp is in the first 48 bytes of the message
+#ifdef WITH_PING
 static const int UDP_PACKET_SIZE = 256; // max. length of a UDP packet
+#else
+static const int UDP_PACKET_SIZE = 0;
+#endif
+
 static const int MAX_PACKET_SIZE = MAX(NTP_PACKET_SIZE,UDP_PACKET_SIZE);
 
 // buffer shared for NTP and UDP packets
+#if defined(WITH_NTP) || defined(WITH_PING)
 static char packetBuffer[MAX_PACKET_SIZE];
+#endif
 
 // a string to hold incoming serial data (commands)
 static char   input_buffer[22]= { 0 };  // longest cmd: "J=aa.bb.cc.dd.ee.ff\0" (20 characters)
@@ -58,23 +67,32 @@ static char * inputPos  = input_buffer;
 static char * inputEnd  = input_buffer+sizeof(input_buffer)-1;
 boolean       input_complete = false;
 
+#ifdef WITH_PING
 static SOCKET pingSocket = 0;
+#endif
 
 static boolean wasReset        = false;
 static boolean wasPaused       = false;
+#ifdef WITH_NTP
 static boolean wasNightlyReset = false;
+#endif
 
 static uint16_t errors   = 0;
 
 static s_time time_utc = { valid : false,  updated : 0 };
+#ifdef WITH_TZ      
 static s_time time_loc = { valid : false,  updated : 0 };
+#else
+#define time_loc time_utc
+#endif
 
 static byte localAddr[4] = { 0, 0, 0, 0};
 
 static s_config config = DEFAULT_CONFIG;
 
 //unsigned long timeoutDhcp = 60000; // the default (60s)
-const unsigned long   timeoutDhcp =  8000; // shorter (8s)  
+const unsigned long timeoutDhcp =  8000; // shorter (8s)  
+const unsigned long timeoutNTP  =  1000;
 
 static DhcpClass dhcp;
 
@@ -134,30 +152,43 @@ char toUpper(char c)
   return c;
 }
 
+#ifdef WITH_HELP
 static boolean showHelp()
 {
   PPRINTLN(
+    #ifdef WITH_SETMAC
     "H:J=mac  own mac addr\r\n"
-    "H:I=ip   remote IP to ping\r\n"
+    #endif
+    "H:I=ip   remote IP to check\r\n"
+    "H:V      run check now\r\n"
+    #ifdef WITH_NTP
     "H:N=ip   remote timeserver IP\r\n"
     "H:F=1|0  do fetch time|don't\r\n"
+    "H:U      fetch time now\r\n"
+    #ifdef WITH_TZ    
+    "H:Z=2    timezone\r\n"
+    #endif    
+    #endif
     "H:T=4    request timeout\r\n"
     "H:W=10   wait time between checks\r\n"
-    "H:Z=2    timezone\r\n"
     "H:R=10   retries\r\n"
     "H:P=1|0  pause on|off\r\n"
+    #ifdef WITH_PING
     "H:M=1|2  ping|dhcp mode\r\n"
+    #endif    
+    #ifdef WITH_NTP    
     "H:S=9    office start hour\r\n"
     "H:E=19   set office end\r\n"
     "H:Y=17   same for fridays\r\n"
+    #endif
     "H:C      show config\r\n"
-    "H:U      update time now\r\n"
     "H:B=4711 reboot uC\r\n"
     "H:X=4711 factory reset uC\r\n"
     "H:Q=4711 reset switch now\r\n"
     "H:H      help");
   return true;
 }
+#endif
 
 static boolean parseInt(const char * str, int &i, int min, int max)
 {
@@ -170,34 +201,29 @@ static boolean parseInt(const char * str, int &i, int min, int max)
 
 static boolean parseIP(const char * str, byte addr[4])
 {
-  int a,b,c,d;
-  if (4==sscanf(str, "%i.%i.%i.%i", &a, &b, &c, &d))
+  int i[4];
+  if (4==sscanf(str, "%i.%i.%i.%i", i, i+1, i+2, i+3))
   {
-    addr[0] = a;
-    addr[1] = b;
-    addr[2] = c;
-    addr[3] = d;
+    for (byte n=0; n<4; n++) addr[n] = (byte)(i[n]);
     return true;
   }
   return false;
 }
 
-static boolean parseMAC(const char * str, byte addr[6])
+#ifdef WITH_SETMAC
+boolean parseMAC(const char * str, byte addr[6])
 {
-  int a,b,c,d,e,f;
-  if (6==sscanf(str, "%x:%x:%x:%x:%x:%x", &a, &b, &c, &d, &e, &f))
+  int i[6];
+  if (6==sscanf(str, "%x:%x:%x:%x:%x:%x", i, i+1, i+2, i+3, i+4, i+5))
   {
-    addr[0] = (byte)a;
-    addr[1] = (byte)b;
-    addr[2] = (byte)c;
-    addr[3] = (byte)d;
-    addr[4] = (byte)e;
-    addr[5] = (byte)f;
+    for (byte n=0; n<6; n++) addr[n] = (byte)(i[n]);
     return true;
   }
   return false;
 }
+#endif
 
+#ifdef WITH_RNDMAC
 uint8_t createRandom()
 {
   int analogPin = 3;
@@ -208,6 +234,7 @@ uint8_t createRandom()
   }    
   return res;
 }
+#endif
 
 static void handleCommand()
 {
@@ -218,7 +245,10 @@ static void handleCommand()
     const char  * arg    = &input_buffer[2];
     boolean       valid  = false;
     boolean       save   = false;
+    boolean       check  = false;
+    #ifdef WITH_NTP
     boolean       update = false;
+    #endif
     boolean       reset  = false;
     int           i;
 
@@ -227,22 +257,31 @@ static void handleCommand()
       // ignore empty lines
       valid = true; 
     }
+    #ifdef WITH_HELP    
     else if ('H'==first || '?'==first)
     {
       valid = showHelp();
     }
+    #endif    
     else if ('C'==first)
     {
       valid = configDump();
     }
+    #ifdef WITH_NTP
     else if ('U'==first)
     {
       valid = update = true;
+    }
+    #endif
+    else if ('V'==first)
+    {
+      valid = check = true;
     }
     else if ('='!=delim)
     {
       valid = false;
     }    
+    #ifdef WITH_PING
     else if ('I'==first)
     {
       if ((valid=parseIP(arg,config.pingAddr)))
@@ -250,6 +289,8 @@ static void handleCommand()
         save = true;
       }
     }
+    #endif    
+    #ifdef WITH_SETMAC
     else if ('J'==first)
     {
       if ((valid=parseMAC(arg,config.mac)))
@@ -257,6 +298,7 @@ static void handleCommand()
         save = true;
       }
     }
+    #endif    
     else if ('N'==first)
     {
       if ((valid=parseIP(arg,config.timeServer)))
@@ -294,6 +336,7 @@ static void handleCommand()
         save = true;
       }
     }
+#ifdef WITH_TZ    
     else if ('Z'==first)
     {
       if ((valid=parseInt(arg, i, -14, 14)))
@@ -302,6 +345,7 @@ static void handleCommand()
         save = true;
       }
     }
+#endif    
     else if ('S'==first)
     {
       if ((valid=parseInt(arg, i, 0, 24)))
@@ -388,10 +432,16 @@ static void handleCommand()
     {
       configSave(MAGIC);
     }
+    else if (check)
+    {
+      checkConnection();
+    }    
+    #ifdef WITH_NTP
     else if (update)
     {
       timeUpdate(true);
     }
+    #endif
     else if (reset)
     {
        resetSwitch();
@@ -424,17 +474,44 @@ void eepromWrite(byte * src, byte * addr, uint16_t len)
 
 static boolean configDump()
 {
+  PPRINT("C:features: ");
+  #ifdef WITH_PING
+  PPRINT(" PING");
+  #endif
+  #ifdef WITH_HELP
+  PPRINT(" HELP");
+  #endif
+  #ifdef WITH_SETMAC
+  PPRINT(" SETMAC");
+  #endif
+  #ifdef WITH_RNDMAC
+  PPRINT(" RNDMAC");
+  #endif
+  #ifdef WITH_TZ
+  PPRINT(" TZ");
+  #endif
+  #ifdef WITH_NTP
+  PPRINT(" NTP");
+  #endif
+  println();
+  
   PPRINT("C:localAddr: "); dumpIP(localAddr);         println();
   PPRINT("C:mac:       "); dumpMac(config.mac); println();
   PPRINT("C:mode:      "); Serial.print(config.mode);       println();;
   PPRINT("C:timeout:   "); Serial.print(config.timeout);    println();;
   PPRINT("C:waitTime:  "); Serial.print(config.waitTime);   println();;
   PPRINT("C:retries:   "); Serial.print(config.retries);    println();;
+  #ifdef WITH_PING
   PPRINT("C:pingAddr:  "); dumpIP(config.pingAddr);   println();
+  #endif  
+  #ifdef WITH_NTP
   PPRINT("C:timeServer:"); dumpIP(config.timeServer); println();
   PPRINT("C:fetchTime: "); Serial.print(config.fetchTime);  println();;
+  #ifdef WITH_TZ  
   PPRINT("C:timezone:  "); Serial.print(config.timezone);   println();;
+  #endif  
   PPRINT("C:office:    "); Serial.print(config.officeStart); PPRINT("-"); Serial.print(config.officeEnd); PPRINT(" (FR: "); Serial.print(config.officeEndFr); PPRINTLN(")");
+  #endif
   return true;
 }
 
@@ -444,7 +521,7 @@ static void configLoad()
   if (config.magic!=MAGIC)
   {
     config = DEFAULT_CONFIG;
-    
+    #ifdef WITH_RNDMAC    
     // fill the last 3 octets of the mac with random values
     for (uint8_t i=3; i<6; i++)
     {
@@ -458,9 +535,12 @@ static void configLoad()
         }
       }
     }
-    
+    #endif    
     eepromWrite((byte*)&config, 0, sizeof(config));
   }
+  #ifndef WITH_NTP
+  config.fetchTime = false;
+  #endif
   configDump();
 }
 
@@ -483,9 +563,10 @@ static void mydelay(long ms)
   while (millis()<end);
 }
 
+#ifdef WITH_NTP
 // send an NTP request to the time server at the given address 
 //static unsigned long sendNTPpacket(EthernetUDP& Udp, IPAddress& address)
-static void sendNTPpacket(EthernetUDP& Udp, byte address[4])
+void sendNTPpacket(EthernetUDP& Udp, byte address[4])
 {
   // set all bytes in the buffer to 0
   memset(packetBuffer, 0, NTP_PACKET_SIZE); 
@@ -509,6 +590,7 @@ static void sendNTPpacket(EthernetUDP& Udp, byte address[4])
   Udp.endPacket();   
   //return 0;
 }
+#endif
 
 void dumpIP(byte addr[4])
 {
@@ -530,33 +612,6 @@ void dumpMac(byte addr[6])
   }
 }
 
-/*
-int EthernetClass::begin(uint8_t *mac_address)
-{
-  static DhcpClass s_dhcp;
-  _dhcp = &s_dhcp;
-
-  // Initialise the basic info
-  W5100.init();
-  W5100.setMACAddress(mac_address);
-  W5100.setIPAddress(IPAddress(0,0,0,0).raw_address());
-
-  // Now try to get our config info from a DHCP server
-  int ret = _dhcp->beginWithDHCP(mac_address);
-  if(ret == 1)
-  {
-    // We've successfully found a DHCP server and got our configuration info, so set things
-    // accordingly
-    W5100.setIPAddress(_dhcp->getLocalIp().raw_address());
-    W5100.setGatewayIp(_dhcp->getGatewayIp().raw_address());
-    W5100.setSubnetMask(_dhcp->getSubnetMask().raw_address());
-    _dnsServerAddress = _dhcp->getDnsServerIp();
-  }
-
-  return ret;
-}
-*/
-
 void printMillis(long l)
 {
   Serial.print(l/1000); PPRINT("."); Serial.print(l%1000); 
@@ -575,11 +630,14 @@ void setupEther()
   // extra before the actual retry loop below with a very short tiomeout
   dhcp.beginWithDHCP(config.mac, 100);        
   
+  uint32_t start, end;
   do
   {
     PPRINT("S:DHCP?("); printMillis(timeoutDhcp); PPRINTLN(")");
 
+    start = millis();
     rc = dhcp.beginWithDHCP(config.mac, timeoutDhcp);        
+    end = millis();
     if (0==rc) 
     {
       PPRINTLN("E:DHCP");
@@ -600,7 +658,7 @@ void setupEther()
   memcpy(localAddr, &(dhcp.getLocalIp()[0]), 4);
 
   // print your local IP address:
-  PPRINT("S:DHCP: ");
+  PPRINT("S:DHCP:("); printMillis(end-start); PPRINT("):");
   dumpIP(localAddr);
   println();
 
@@ -630,7 +688,6 @@ void timeDump(s_time & t)
 {
   if (!t.valid)
   {
-    //PPRINT("?");
     return;
   }
   uint8_t h = t.hours;
@@ -651,15 +708,13 @@ void epochToHMS(unsigned long epoch, s_time &t)
     t.updated = millis();
 }
 
+#ifdef WITH_NTP
 boolean timeUpdate(boolean force)
 {
   if (!config.fetchTime) return false;
   
   uint32_t now  = millis();
   uint32_t diff = (now-time_utc.updated)/1000; // seconds
-  
-//  PPRINT("timeUpdate: diff="); Serial.println(diff);
-//  PPRINT("timeUpdate: updated="); Serial.println(time_utc.updated);
   
   boolean valid = time_utc.valid;
 
@@ -672,12 +727,13 @@ boolean timeUpdate(boolean force)
     time_utc.updated = millis();
     
     PPRINTLN("I:NTP?");    
+    uint32_t start = millis();
     EthernetUDP Udp;
     Udp.begin(localPort);
     
     sendNTPpacket(Udp, config.timeServer); // send an NTP packet to a time server
     //PPRINTLN("D:UDP SENT");
-    mydelay(1000);
+    mydelay(timeoutNTP);
    
     //PPRINTLN("D:UDP PARSE");  
     //Serial.println( Udp.parsePacket() );
@@ -686,7 +742,8 @@ boolean timeUpdate(boolean force)
         //PPRINTLN("D:UDP PARSED"); 
         // We've received a packet, read the data from it
         Udp.read(packetBuffer,NTP_PACKET_SIZE);  // read the packet into the buffer
-    
+        uint32_t end = millis();
+        
         //the timestamp starts at byte 40 of the received packet and is four bytes,
         // or two words, long. First, esxtract the two words:
     
@@ -707,19 +764,26 @@ boolean timeUpdate(boolean force)
             
         // this will also set the valid flag:
         epochToHMS(epoch, time_utc);
-        PPRINT("I:NTP:");        
-        timeDump(time_utc);
-        println();
-      }
+        PPRINT("I:NTP:("); printMillis(end-start); PPRINT("):"); timeDump(time_utc); println();
+    }
+    else
+    {
+      uint32_t end = millis();
+      PPRINT("E:NTP("); printMillis(end-start); PPRINTLN(")"); 
+    }      
       
-      // eelease any resources being used by this EthernetUDP instance 
-      Udp.stop();
+    // release any resources being used by this EthernetUDP instance 
+    Udp.stop();
   }
 
+#ifdef WITH_TZ      
   extrapolateTime();
+#endif  
   return true;
 }
+#endif
 
+#ifdef WITH_TZ
 void extrapolateTime()
 {
   if (!time_utc.valid) 
@@ -746,31 +810,40 @@ void extrapolateTime()
   diff/=1000;
   epochToHMS(time_utc.epoch+diff+3600*config.timezone, time_loc);    
 }
+#endif
 
 static boolean checkConnection()
 {
   boolean success = false;
 
   PPRINT("T"); timeDump(time_loc); PPRINT(":");
+  uint32_t start = millis();
   
+#ifdef WITH_PING  
   if (MODE_PING==config.mode)
   {
       PPRINTLN("PING?");
       ICMPPing ping(pingSocket);
       success = ping(config.timeout, config.pingAddr, packetBuffer);
-      
+      uint32_t end = millis();
+#ifdef WITH_TZ      
       extrapolateTime();
-      PPRINT("T"); timeDump(time_loc); PPRINT(":PING:"); Serial.print(packetBuffer); println();
+#endif
+      PPRINT("T"); timeDump(time_loc); PPRINT(":PING:("); printMillis(end-start); PPRINT("):"); Serial.print(packetBuffer); println();
   }
   else     
+#endif  
   {
       unsigned long to = 1000UL*config.timeout;
       PPRINT("DHCP?("); printMillis(to); PPRINTLN(")");
       success = dhcp.beginWithDHCP(config.mac, to)!=0;              
       if (success)
       {        
+        uint32_t end = millis();
+#ifdef WITH_TZ      
         extrapolateTime();
-        PPRINT("T"); timeDump(time_loc); PPRINT(":DHCP:");
+#endif        
+        PPRINT("T"); timeDump(time_loc); PPRINT(":DHCP:("); printMillis(end-start); PPRINT("):"); 
         
         for (byte b=0; b<4; b++) 
         {
@@ -780,8 +853,7 @@ static boolean checkConnection()
         }
         println();
       }
-  }
-  
+  }  
   
   return success;
 }
@@ -838,7 +910,10 @@ boolean resetBlocked()
 void loop()
 {
   digitalWrite(PIN_LED, HIGH);    
+  
+  #ifdef WITH_NTP
   timeUpdate(false); 
+  #endif
   
   if (wasPaused)
   {
@@ -861,7 +936,9 @@ void loop()
   {
     uint32_t now = millis();
     PPRINT("OK:"); printMillis(now); 
+    #ifdef WITH_NTP
     if (wasNightlyReset) PPRINT(" (NIGHTLYRST)");
+    #endif
     println();
 
     errors = 0;
@@ -897,6 +974,7 @@ void loop()
     mydelay(500);
   }
   
+  #ifdef WITH_NTP
   if (config.fetchTime && time_loc.valid && time_loc.hours<1 && time_loc.minutes<15)
   {
     if (!wasNightlyReset)
@@ -910,6 +988,7 @@ void loop()
   {
     wasNightlyReset = false;
   }
+  #endif
 
   digitalWrite(PIN_LED, LOW);  
   
