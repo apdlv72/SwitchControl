@@ -3,7 +3,7 @@ SwitchControl
 
 Monitors a network connection and reset a switch (or any other device) if that fails.
 
-I created this sketch because some cheap switches in our office tend to faif after
+I created this sketch because some cheap switches in our office tend to fail after
 some days of operation and need to be reset manually.
 
 The sketch was tested on an Arduino Meda 2560, an ethernet shield, a relay connected
@@ -17,7 +17,7 @@ in a timely fashion or it can do DHCP requests on a regular basis and check if t
 When configured to synchronize its time with a NTP time server, office hours can be defined
 during which resets of the controller switch should be suppresed.
 
-The sketch will accept adminitrator commands on the serial port (thus on bluetooth) to
+The sketch will accept administrator commands on the serial port (thus on bluetooth) to
 modify the target IP, the timeout and the retry count and store them opermanantly in EEProm:
 
 	J=mac  set the mac address of the control (aa:bb:cc:dd:ee:ff)
@@ -35,7 +35,7 @@ modify the target IP, the timeout and the retry count and store them opermanantl
 	Y=17   same for fridays      [0,...,24]
 	C      show config
 	U      update time from timeserver now
-	B=4711 reboot then micro controller ("4711" is fixed and acts as a confirmation)
+	B=4711 reboot the micro controller ("4711" is fixed and acts as a confirmation)
 	X=4711 factory reset the micro controller
 	Q=4711 reset the attached switch now
 	H      help
