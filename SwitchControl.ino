@@ -13,7 +13,7 @@
 #include <EthernetUdp.h>
 #include <Dhcp.h>
 
-#ifdef WITH_PING
+#ifdef WITH_TESTPING
 #include <ICMPPing.h>
 #endif
 #include <avr/eeprom.h>
@@ -38,17 +38,18 @@ static const s_config DEFAULT_CONFIG =
   retries        :  3,
   timeout        :  4,
   waitTime       : 15,
-  pingAddr       : { 10, 2, 0, 1 },
-  timeServer     : { 10, 2, 0, 1 },  
+  pingAddr       : { 10,2,0,1 },
+  timeServer     : { 10,2,0,1 },  
   fetchTime      : true,
   timezone       :  2,
   officeStart    :  9,
   officeEnd      : 19,
-  officeEndFr    : 17
+  officeEndFr    : 17,
+  fixedIp        : { 0,0,0,0 }
 };
 
 static const int NTP_PACKET_SIZE =  48; // NTP time stamp is in the first 48 bytes of the message
-#ifdef WITH_PING
+#ifdef WITH_TESTPING
 static const int UDP_PACKET_SIZE = 256; // max. length of a UDP packet
 #else
 static const int UDP_PACKET_SIZE = 0;
@@ -57,7 +58,7 @@ static const int UDP_PACKET_SIZE = 0;
 static const int MAX_PACKET_SIZE = MAX(NTP_PACKET_SIZE,UDP_PACKET_SIZE);
 
 // buffer shared for NTP and UDP packets
-#if defined(WITH_NTP) || defined(WITH_PING)
+#if defined(WITH_NTP) || defined(WITH_TESTPING)
 static char packetBuffer[MAX_PACKET_SIZE];
 #endif
 
@@ -67,7 +68,7 @@ static char * inputPos  = input_buffer;
 static char * inputEnd  = input_buffer+sizeof(input_buffer)-1;
 boolean       input_complete = false;
 
-#ifdef WITH_PING
+#ifdef WITH_TESTPING
 static SOCKET pingSocket = 0;
 #endif
 
@@ -89,6 +90,9 @@ static s_time time_loc = { valid : false,  updated : 0 };
 static byte localAddr[4] = { 0, 0, 0, 0};
 
 static s_config config = DEFAULT_CONFIG;
+
+// place log in EEProm imediately after config
+s_log * LOG = (s_log *)sizeof(s_config);
 
 //unsigned long timeoutDhcp = 60000; // the default (60s)
 const unsigned long timeoutDhcp =  8000; // shorter (8s)  
@@ -157,9 +161,10 @@ static boolean showHelp()
 {
   PPRINTLN(
     #ifdef WITH_SETMAC
-    "H:J=mac  own mac addr\r\n"
+    "H:J=mac  set own mac addr\r\n"
     #endif
-    "H:I=ip   remote IP to check\r\n"
+    "H:I=ip   set remote IP to check\r\n"
+    "H:L=ip   set local IP (disable: 0.0.0.0)\r\n"
     "H:V      run check now\r\n"
     #ifdef WITH_NTP
     "H:N=ip   remote timeserver IP\r\n"
@@ -173,7 +178,7 @@ static boolean showHelp()
     "H:W=10   wait time between checks\r\n"
     "H:R=10   retries\r\n"
     "H:P=1|0  pause on|off\r\n"
-    #ifdef WITH_PING
+    #ifdef WITH_TESTPING
     "H:M=1|2  ping|dhcp mode\r\n"
     #endif    
     #ifdef WITH_NTP    
@@ -281,7 +286,7 @@ static void handleCommand()
     {
       valid = false;
     }    
-    #ifdef WITH_PING
+    #ifdef WITH_TESTPING
     else if ('I'==first)
     {
       if ((valid=parseIP(arg,config.pingAddr)))
@@ -290,6 +295,13 @@ static void handleCommand()
       }
     }
     #endif    
+    else if ('L'==first)
+    {
+      if ((valid=parseIP(arg,config.fixedIp)))
+      {
+        save = true;
+      }
+    }
     #ifdef WITH_SETMAC
     else if ('J'==first)
     {
@@ -475,7 +487,7 @@ void eepromWrite(byte * src, byte * addr, uint16_t len)
 static boolean configDump()
 {
   PPRINT("C:features: ");
-  #ifdef WITH_PING
+  #ifdef WITH_TESTPING
   PPRINT(" PING");
   #endif
   #ifdef WITH_HELP
@@ -501,7 +513,7 @@ static boolean configDump()
   PPRINT("C:timeout:   "); Serial.print(config.timeout);    println();;
   PPRINT("C:waitTime:  "); Serial.print(config.waitTime);   println();;
   PPRINT("C:retries:   "); Serial.print(config.retries);    println();;
-  #ifdef WITH_PING
+  #ifdef WITH_TESTPING
   PPRINT("C:pingAddr:  "); dumpIP(config.pingAddr);   println();
   #endif  
   #ifdef WITH_NTP
@@ -538,6 +550,9 @@ static void configLoad()
     #endif    
     eepromWrite((byte*)&config, 0, sizeof(config));
   }
+  #ifndef WITH_TESTPING
+  config.mode = MODE_DHCP;  
+  #endif
   #ifndef WITH_NTP
   config.fetchTime = false;
   #endif
@@ -617,6 +632,11 @@ void printMillis(long l)
   Serial.print(l/1000); PPRINT("."); Serial.print(l%1000); 
 }
 
+boolean haveFixedIp()
+{
+  return config.fixedIp[0] && config.fixedIp[1] && config.fixedIp[2] && config.fixedIp[3];
+}
+
 void setupEther()
 {
   // start Ethernet
@@ -625,44 +645,68 @@ void setupEther()
 
   int rc;
   PPRINTLN("S:BEGIN");
-  Ethernet.begin(config.mac, ip);    
-  // for some reason, the very first DHCP request fails reproducibly, thus do one
-  // extra before the actual retry loop below with a very short tiomeout
-  dhcp.beginWithDHCP(config.mac, 100);        
-  
   uint32_t start, end;
-  do
+  
+  #ifdef WITH_DHCP
+  if (!haveFixedIp())
   {
-    PPRINT("S:DHCP?("); printMillis(timeoutDhcp); PPRINTLN(")");
-
-    start = millis();
-    rc = dhcp.beginWithDHCP(config.mac, timeoutDhcp);        
-    end = millis();
-    if (0==rc) 
+    Ethernet.begin(config.mac, ip);    
+    // for some reason, the very first DHCP request fails reproducibly, thus do one
+    // extra before the actual retry loop below with a very short tiomeout
+    dhcp.beginWithDHCP(config.mac, 100);        
+    
+    do
     {
-      PPRINTLN("E:DHCP");
-      for (int i=0; i<20; i++)
+      PPRINT("S:DHCP?("); printMillis(timeoutDhcp); PPRINTLN(")");
+  
+      start = millis();
+      rc = dhcp.beginWithDHCP(config.mac, timeoutDhcp);        
+      end = millis();
+      if (0==rc) 
       {
-        digitalWrite(PIN_LED, i%2);
-        mydelay(100);
+        PPRINTLN("E:DHCP");
+        for (int i=0; i<20; i++)
+        {
+          digitalWrite(PIN_LED, i%2);
+          mydelay(100);
+        }
       }
+      else
+      {
+        Ethernet.begin(config.mac, dhcp.getLocalIp());    
+      }
+    }
+    while (0==rc);
+  
+    // save in global variable
+    memcpy(localAddr, &(dhcp.getLocalIp()[0]), 4);
+  
+    // print your local IP address:
+    PPRINT("S:DHCP:("); printMillis(end-start); PPRINT("):"); dumpIP(localAddr); println();
+    digitalWrite(PIN_LED, LOW);    
+    return;
+  }
+  #endif
+  
+  while (!haveFixedIp())
+  {
+    mydelay(1000);
+    if (haveFixedIp())
+    {
+      #ifndef WITH_DHCP
+      memcpy(localAddr, config.fixedIp, 4);
+      start = millis();
+      Ethernet.begin(config.mac, config.fixedIp);    
+      end  = millis();
+      PPRINT("S:ETHER:("); printMillis(end-start); PPRINT("):"); dumpIP(localAddr); println();
+      #endif
     }
     else
     {
-      Ethernet.begin(config.mac, dhcp.getLocalIp());    
+      PPRINT("E:NOFIXEDIP");
     }
   }
-  while (0==rc);
-  
-  // savi in global variable
-  memcpy(localAddr, &(dhcp.getLocalIp()[0]), 4);
-
-  // print your local IP address:
-  PPRINT("S:DHCP:("); printMillis(end-start); PPRINT("):");
-  dumpIP(localAddr);
-  println();
-
-  digitalWrite(PIN_LED, LOW);
+  digitalWrite(PIN_LED, LOW);    
 }
 
 static void dumpDayOfWeek(int dow)
@@ -819,20 +863,22 @@ static boolean checkConnection()
   PPRINT("T"); timeDump(time_loc); PPRINT(":");
   uint32_t start = millis();
   
-#ifdef WITH_PING  
+  #ifdef WITH_TESTPING  
   if (MODE_PING==config.mode)
   {
       PPRINTLN("PING?");
       ICMPPing ping(pingSocket);
       success = ping(config.timeout, config.pingAddr, packetBuffer);
       uint32_t end = millis();
-#ifdef WITH_TZ      
+      #ifdef WITH_TZ      
       extrapolateTime();
-#endif
+      #endif
       PPRINT("T"); timeDump(time_loc); PPRINT(":PING:("); printMillis(end-start); PPRINT("):"); Serial.print(packetBuffer); println();
   }
-  else     
-#endif  
+  #endif
+  
+  #ifdef WITH_TESTDHCP
+  if (MODE_DHCP==config.mode)
   {
       unsigned long to = 1000UL*config.timeout;
       PPRINT("DHCP?("); printMillis(to); PPRINTLN(")");
@@ -840,9 +886,9 @@ static boolean checkConnection()
       if (success)
       {        
         uint32_t end = millis();
-#ifdef WITH_TZ      
+        #ifdef WITH_TZ      
         extrapolateTime();
-#endif        
+        #endif        
         PPRINT("T"); timeDump(time_loc); PPRINT(":DHCP:("); printMillis(end-start); PPRINT("):"); 
         
         for (byte b=0; b<4; b++) 
@@ -854,6 +900,7 @@ static boolean checkConnection()
         println();
       }
   }  
+  #endif
   
   return success;
 }

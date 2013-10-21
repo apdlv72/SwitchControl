@@ -4,12 +4,14 @@
 #include <Arduino.h>         
 #include <Ethernet.h>
 
-//#define WITH_PING
+//#define WITH_TESTPING
 #define WITH_HELP
-//#define WITH_SETMAC
+#define WITH_SETMAC
 //#define WITH_RNDMAC
 #define WITH_TZ
 #define WITH_NTP
+#define WITH_TESTDHCP
+#define WITH_DHCP
 
 // Workaround for http://gcc.gnu.org/bugzilla/show_bug.cgi?id=34734
 #ifdef PROGMEM
@@ -53,8 +55,17 @@ typedef struct
   uint8_t   officeEnd;
   // same on fridays
   uint8_t   officeEndFr; 
+  // fixed IP when not using (not compiled in) DHCP 
+  byte      fixedIp[4];  
 } 
 s_config;
+
+typedef struct
+{
+  long last_resets[100];
+  long last_warnings[20];
+}
+s_log;
 
 // This is meant to break with an error should the EEProm capacity be exceeded:
 struct FailOnEEPromExceess { int c[E2END-sizeof(s_config)]; };
