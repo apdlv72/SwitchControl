@@ -4,14 +4,17 @@
 #include <Arduino.h>         
 #include <Ethernet.h>
 
-//#define WITH_TESTPING
+#define WITH_TESTPING
 #define WITH_HELP
 #define WITH_SETMAC
-//#define WITH_RNDMAC
+#define WITH_RNDMAC
 #define WITH_TZ
 #define WITH_NTP
 #define WITH_TESTDHCP
 #define WITH_DHCP
+#define WITH_HTTPLOG
+#define WITH_SYSLOG
+
 
 // Workaround for http://gcc.gnu.org/bugzilla/show_bug.cgi?id=34734
 #ifdef PROGMEM
@@ -19,10 +22,28 @@
 #define PROGMEM __attribute__((section(".progmem.data")))
 #endif
 
-#ifdef WITH_PING
+#ifdef WITH_TESTPING
 static const uint8_t MODE_PING = 1;
 #endif
 static const uint8_t MODE_DHCP = 2;
+
+typedef struct
+{
+	byte     isUsed     : 1;
+	byte     isNTP      : 1;
+	byte     isLast     : 1;
+	uint32_t timestamp;
+	char     text[8];
+} s_log;
+
+
+typedef struct
+{
+	  byte isValid : 1;
+	  byte isNTP   : 1;
+	  unsigned long timestamp;
+} s_event_time;
+
 
 // Configuration. everything that goes to EEProm is inside this struct.
 // Regardless whether any of the WITH_* features have been compiled in, 
@@ -56,16 +77,23 @@ typedef struct
   // same on fridays
   uint8_t   officeEndFr; 
   // fixed IP when not using (not compiled in) DHCP 
-  byte      fixedIp[4];  
+  byte      fixedIp[4]; 
+ // ip addr of syslog server 
+  byte      syslogIP[4];
+  // the remote address to ping
+  byte      httpIP[4];
+  uint16_t  httpPort;
+  char      httpPath[64];
+
+  s_event_time lastReset;
+  s_event_time lastReboot;
+  s_event_time lastChange;
+  s_event_time lastStart;
 } 
 s_config;
 
-typedef struct
-{
-  long last_resets[100];
-  long last_warnings[20];
-}
-s_log;
+
+
 
 // This is meant to break with an error should the EEProm capacity be exceeded:
 struct FailOnEEPromExceess { int c[E2END-sizeof(s_config)]; };
