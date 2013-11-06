@@ -24,9 +24,10 @@
 #define PPRINTLN(TEXT) showPgmStringLn(PSTR(TEXT))
 #define MAX(A,B) ((A)>(B)?(A):(B))
 
-static const uint16_t MAGIC    = 4713;
+static const uint16_t MAGIC    = 0x1147;
 static const uint8_t PIN_LED   = 13;
 static const uint8_t PIN_RELAY = 12;
+static const uint8_t PIN_RESET =  7;
 
 // local port to listen for UDP packets
 static const unsigned int localPort = 2390;
@@ -37,9 +38,10 @@ static const s_config DEFAULT_CONFIG =
   // coffee, coffee. 2nd coffee will be overwritten with randoms on 1st time power on.
   mac            : { 0xC0, 0xFF, 0xEE, 0xC0, 0xFF, 0xEE},
   mode           : MODE_DHCP,
-  retries        :  3,
-  timeout        :  4,
-  waitTime       : 15,
+  retries        : 4,
+  timeoutPingS   : 2, // seconds
+  timeoutDhcpMs  : 500, // ms
+  waitTime       : 10,
   pingAddr       : { 10,2,0,1 },
   timeServer     : { 10,2,0,1 },
   fetchTime      : true,
@@ -55,7 +57,8 @@ static const s_config DEFAULT_CONFIG =
   lastReset      : { isValid : 0 },
   lastReboot     : { isValid : 0 },
   lastChange     : { isValid : 0 },
-  lastStart      : { isValid : 0 }
+  lastStart      : { isValid : 0 },
+  totalFailures  : 0
 };
 
 static const int NTP_PACKET_SIZE =  48; // NTP time stamp is in the first 48 bytes of the message
@@ -89,6 +92,7 @@ static boolean wasNightlyReset = false;
 #endif
 
 static uint16_t errors   = 0;
+static uint32_t totalFiluresSaveTime = 0;
 
 static s_time time_utc = { valid : false,  updated : 0 };
 #ifdef WITH_TZ
@@ -201,7 +205,6 @@ boolean logs_show()
 
 
 //unsigned long timeoutDhcp = 60000; // the default (60s)
-const unsigned long timeoutDhcp =  8000; // shorter (8s)
 const unsigned long timeoutNTP  =  1000;
 
 static DhcpClass dhcp;
@@ -239,7 +242,13 @@ void serialEvent()
   while (Serial.available())
   {
     char c = (char)Serial.read();
-    if (c=='\n' || c=='\r')
+    if (c==0x1b) // || c==0x01 || c==0x00 || c=='#') // handle stk500 sync attempt
+    {      
+      Serial.end();
+      //Serial.println("RST");
+      asm volatile ("jmp 0");
+    }
+    else if (c=='\n' || c=='\r')
     {
       *inputPos = 0; // strip CR at end for convenience
       input_complete = true;
@@ -280,7 +289,8 @@ static boolean showHelp()
     "H:Z=2    timeZone\r\n"
     #endif
     #endif
-    "H:T=4    request Timeout\r\n"
+    "H:T=4    ping Timeout (s)\r\n"
+    "H:D=4    Dhcp timeout (ms)\r\n"
     "H:W=10   Wait time between checks\r\n"
     "H:R=10   Retries\r\n"
     "H:P=1|0  Pause on|off\r\n"
@@ -555,9 +565,19 @@ static void handleCommand()
     }
     else if ('T'==first)
     {
-      if ((valid=parseInt(arg, i, 1, 180)))
+      // 180 secs should be more than sufficient
+      if ((valid=parseInt(arg, i, 1, 180))) 
       {
-        config.timeout = i;
+        config.timeoutPingS = i;
+        save = true;
+      }
+    }
+    else if ('D'==first)
+    {
+      // 180 secs should be more than sufficient
+      if ((valid=parseInt(arg, i, 1, 60000))) 
+      {
+        config.timeoutDhcpMs = i;
         save = true;
       }
     }
@@ -659,8 +679,9 @@ static void handleCommand()
         	configSave(MAGIC);
 
         	// give serial a bit more a chance to flush
-        	delay(500);
-        	asm volatile ("jmp 0");
+        	//delay(500);
+                doReset();
+        	//asm volatile ("jmp 0");
         }
       }
     }
@@ -754,35 +775,38 @@ static boolean configDump()
   
   println();
 
-  PPRINT("C:localAddr: "); dumpIP(localAddr);      println();
-  PPRINT("C:fixedIp:   "); dumpIP(config.fixedIp); println();
-  PPRINT("C:mac:       "); dumpMac(config.mac); println();
-  PPRINT("C:mode:      "); Serial.print(config.mode);       println();;
-  PPRINT("C:timeout:   "); Serial.print(config.timeout);    println();;
-  PPRINT("C:waitTime:  "); Serial.print(config.waitTime);   println();;
-  PPRINT("C:retries:   "); Serial.print(config.retries);    println();;
+  PPRINT("C:baudRate:     "); Serial.println(BAUD_RATE); println();
+  PPRINT("C:localAddr:    "); dumpIP(localAddr);         println();
+  PPRINT("C:fixedIp:      "); dumpIP(config.fixedIp);    println();
+  PPRINT("C:mac:          "); dumpMac(config.mac);       println();
+  PPRINT("C:mode:         "); Serial.print(config.mode);       println();;
+  PPRINT("C:timeoutPing:  "); Serial.print(config.timeoutPingS);  PPRINTLN(" s");
+  PPRINT("C:timeoutDHCP:  "); Serial.print(config.timeoutDhcpMs); PPRINTLN(" ms");
+  PPRINT("C:waitTime:     "); Serial.print(config.waitTime);   println();;
+  PPRINT("C:retries:      " ); Serial.print(config.retries);    println();;
   #ifdef WITH_TESTPING
-  PPRINT("C:pingAddr:  "); dumpIP(config.pingAddr);   println();
+  PPRINT("C:pingAddr:     "); dumpIP(config.pingAddr);   println();
   #endif
   #ifdef WITH_NTP
-  PPRINT("C:timeServer:"); dumpIP(config.timeServer); println();
-  PPRINT("C:fetchTime: "); Serial.print(config.fetchTime ? "yes" : "no");  println();;
+  PPRINT("C:timeServer:   "); dumpIP(config.timeServer); println();
+  PPRINT("C:fetchTime:    "); Serial.print(config.fetchTime ? "yes" : "no");  println();;
   #ifdef WITH_TZ
-  PPRINT("C:timezone:  "); Serial.print(config.timezone);   println();;
+  PPRINT("C:timezone:     "); Serial.print(config.timezone);   println();;
   #endif
-  PPRINT("C:office:    "); Serial.print(config.officeStart); PPRINT("-"); Serial.print(config.officeEnd); PPRINT(" (FR: "); Serial.print(config.officeEndFr); PPRINTLN(")");
+  PPRINT("C:office:       "); Serial.print(config.officeStart); PPRINT("-"); Serial.print(config.officeEnd); PPRINT(" (FR: "); Serial.print(config.officeEndFr); PPRINTLN(")");
   #endif
   #ifdef WITH_SYSLOG
-  PPRINT("C:syslogIp:  "); dumpIP(config.syslogIP); println();
+  PPRINT("C:syslogIp:     "); dumpIP(config.syslogIP); println();
   #endif
   #ifdef WITH_HTTPLOG
-  PPRINT("C:httpLog:   http://"); dumpIP(config.httpIP); PPRINT(":"); Serial.print(config.httpPort); Serial.println(config.httpPath);
+  PPRINT("C:httpLog:      http://"); dumpIP(config.httpIP); PPRINT(":"); Serial.print(config.httpPort); Serial.println(config.httpPath);
   #endif
 
-  PPRINT("C:lastReset: "); dumpEventTime(config.lastReset);  PPRINT("\r\n");
-  PPRINT("C:lastReboot:"); dumpEventTime(config.lastReboot); PPRINT("\r\n");
-  PPRINT("C:lastChange:"); dumpEventTime(config.lastChange); PPRINT("\r\n");
-  PPRINT("C:lastStart:");  dumpEventTime(config.lastStart); PPRINT("\r\n");
+  PPRINT("C:lastReset:    "); dumpEventTime(config.lastReset);    PPRINT("\r\n");
+  PPRINT("C:lastReboot:   "); dumpEventTime(config.lastReboot);   PPRINT("\r\n");
+  PPRINT("C:lastChange:   "); dumpEventTime(config.lastChange);   PPRINT("\r\n");
+  PPRINT("C:lastStart:    "); dumpEventTime(config.lastStart);    PPRINT("\r\n");
+  PPRINT("C:totalFailures:"); Serial.print(config.totalFailures); PPRINT("\r\n");
   
   return true;
 }
@@ -839,7 +863,7 @@ static void configLoad()
   #ifndef WITH_NTP
   config.fetchTime = false;
   #endif
-  configDump();
+  //configDump();
 }
 
 static void configSave(uint16_t magic)
@@ -940,10 +964,10 @@ void setupEther()
 
     do
     {
-      PPRINT("S:DHCP?("); printMillis(timeoutDhcp); PPRINTLN(")");
+      PPRINT("S:DHCP?("); printMillis(config.timeoutDhcpMs); PPRINTLN(")");
 
       start = millis();
-      rc = dhcp.beginWithDHCP(config.mac, timeoutDhcp);
+      rc = dhcp.beginWithDHCP(config.mac, config.timeoutDhcpMs);
       end = millis();
       if (0==rc)
       {
@@ -1183,7 +1207,7 @@ static boolean checkConnection()
   {
       PPRINTLN("PING?");
       ICMPPing ping(pingSocket);
-      success = ping(config.timeout, config.pingAddr, packetBuffer);
+      success = ping(config.timeoutPingS, config.pingAddr, packetBuffer);
       uint32_t end = millis();
       #ifdef WITH_TZ
       extrapolateTime();
@@ -1204,9 +1228,8 @@ static boolean checkConnection()
   #ifdef WITH_TESTDHCP
   if (MODE_DHCP==config.mode)
   {
-      unsigned long to = 1000UL*config.timeout;
-      PPRINT("DHCP?("); printMillis(to); PPRINTLN(")");
-      success = dhcp.beginWithDHCP(config.mac, to)!=0;
+      PPRINT("DHCP?("); printMillis(config.timeoutDhcpMs); PPRINTLN(")");
+      success = dhcp.beginWithDHCP(config.mac, config.timeoutDhcpMs)!=0;
       if (success)
       {
         uint32_t end = millis();
@@ -1270,14 +1293,64 @@ void resetSwitch()
   wasReset = true;
 }
 
+//stk500_private.h
+#define Cmnd_STK_GET_SYNC          0x30  // '0'      
+#define Sync_CRC_EOP               0x20  // 'SPACE'
+#define Resp_STK_INSYNC            0x14  // ' '
+
+
+void doReset()
+{
+  digitalWrite(PIN_RESET, LOW);     
+  delay(100);
+  for (;;);
+}  
+
+void checkForSTK500()
+{
+  char last=0, curr=0;
+  
+  for (uint32_t i=0; i<180*1000L; i++)
+  {
+    digitalWrite(PIN_LED, 1==((i/200)%8));    
+
+    if (Serial.available())
+    {
+      last = curr;
+      curr = (char)Serial.read();      
+      // wiring.c for arduino mega sends:
+      // [1b] . [01] . [00] . [01] . [0e] . [01] . [14] 
+      if (0x1b==curr || 0x01==curr || 0x00==curr || 0x01==curr || 0x0e==curr || 0x14==curr || '#'==curr) 
+      { 
+        digitalWrite(PIN_LED, LOW);
+        delay(3700); 
+        doReset();
+        Serial.print("@@@@@@");
+      }
+    }
+    else
+    {
+      delayMicroseconds(20);   
+    }
+  }  
+}
+
 void setup()
 {
-  pinMode(PIN_LED,   OUTPUT);
+  digitalWrite(PIN_RESET, HIGH);
+  pinMode(PIN_RESET, OUTPUT);     
+
+  
+  Serial.begin(BAUD_RATE);
+  pinMode(PIN_LED,OUTPUT);
+  
+  checkForSTK500();  
+  digitalWrite(PIN_LED, LOW);
+  
   pinMode(PIN_RELAY, OUTPUT);
   digitalWrite(PIN_RELAY, HIGH);
 
-  Serial.begin(9600);
-  PPRINTLN("\r\nI:SwitchControl V0.4");
+  PPRINTLN("\r\nI:SwitchControl V0.5");
      
   logs_add("SETUPSTRT");
   configLoad();
@@ -1312,6 +1385,14 @@ boolean resetBlocked()
   return (time_loc.hours<config.officeEnd);
 }
 
+//void loop()
+//{
+//  digitalWrite(PIN_LED, LOW);
+//  mydelay(100);
+//  digitalWrite(PIN_LED, HIGH);
+//  mydelay(100);
+//}
+
 void loop()
 {
   digitalWrite(PIN_LED, HIGH);
@@ -1333,6 +1414,16 @@ void loop()
   if (!success)
   {
     errors++;
+    config.totalFailures++;
+    
+    const long sixHours = 6L*3600*1000;
+    uint32_t now = millis();
+    if (totalFiluresSaveTime+sixHours<now)
+    {
+      configSave(MAGIC);
+      totalFiluresSaveTime = now;
+    }
+    
     // avoid overflow:
     if (errors>1000) errors=1000;
     PPRINT("FAIL:"); Serial.print(errors); println();;
@@ -1340,7 +1431,8 @@ void loop()
   else
   {
     uint32_t now = millis();
-    PPRINT("OK:"); printMillis(now);
+    PPRINT("OK:"); printMillis(now); 
+    PPRINT(",TF="); Serial.print(config.totalFailures);
     #ifdef WITH_NTP
     if (wasNightlyReset) PPRINT(" (NIGHTLYRST)");
     #endif

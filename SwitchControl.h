@@ -4,23 +4,28 @@
 #include <Arduino.h>         
 #include <Ethernet.h>
 
-#define WITH_TESTPING
+// no ping functionality needed
+//#define WITH_TESTPING 
 #define WITH_HELP
 #define WITH_SETMAC
-#define WITH_RNDMAC
+//#define WITH_RNDMAC
 #define WITH_TZ
 #define WITH_NTP
 #define WITH_TESTDHCP
 #define WITH_DHCP
-#define WITH_HTTPLOG
+// logging via http can block quite long thus diabled by default
+//#define WITH_HTTPLOG
 #define WITH_SYSLOG
 
+//#define BAUD_RATE 57600
+#define BAUD_RATE 115200
 
 // Workaround for http://gcc.gnu.org/bugzilla/show_bug.cgi?id=34734
 #ifdef PROGMEM
 #undef PROGMEM
 #define PROGMEM __attribute__((section(".progmem.data")))
 #endif
+
 
 #ifdef WITH_TESTPING
 static const uint8_t MODE_PING = 1;
@@ -58,8 +63,10 @@ typedef struct
   uint8_t   mode;
   // number of trials before network is assumed to be down
   uint16_t  retries;
-  // timeout (for ping requests)
-  uint16_t  timeout;
+  // timeout for ping requests (seconds)
+  uint8_t   timeoutPingS;
+  // timeout for DHCP requests (milliseconds)
+  uint32_t  timeoutDhcpMs;
   // time between two (successful) checks
   uint16_t  waitTime;
   // the remote address to ping
@@ -89,10 +96,10 @@ typedef struct
   s_event_time lastReboot;
   s_event_time lastChange;
   s_event_time lastStart;
+  
+  uint16_t     totalFailures;
 } 
 s_config;
-
-
 
 
 // This is meant to break with an error should the EEProm capacity be exceeded:
