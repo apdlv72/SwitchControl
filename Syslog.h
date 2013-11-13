@@ -75,3 +75,4 @@ private:
 extern SyslogClass Syslog;
 
 #endif
+

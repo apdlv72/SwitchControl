@@ -91,13 +91,18 @@ typedef struct
   byte      httpIP[4];
   uint16_t  httpPort;
   char      httpPath[64];
-
+  // saves time when last reset (of external switch) occured
   s_event_time lastReset;
+  // saves time when uC was rebotted last time (upon command)
   s_event_time lastReboot;
+  // saves time  time of last config change
   s_event_time lastChange;
+  // saves time of last startup of uC
   s_event_time lastStart;
-  
+  // total number of negative test outcomes
   uint16_t     totalFailures;
+  // flag whether to reset the swicth at midnight
+  boolean      doNightlyReset;
 } 
 s_config;
 
@@ -129,4 +134,5 @@ typedef struct
 s_time;
 
 #endif
+
 

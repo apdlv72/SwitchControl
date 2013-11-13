@@ -33,6 +33,7 @@ modify the target IP, the timeout and the retry count and store them opermanantl
 	S=9    set office start hour [0,...,24]
 	E=19   set office end        [0,...,24]
 	Y=17   same for fridays      [0,...,24]
+        @      toggle reset @ midnight
 	C      show config
 	U      update time from timeserver now
 	B=4711 reboot the micro controller ("4711" is fixed and acts as a confirmation)

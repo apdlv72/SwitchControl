@@ -34,79 +34,31 @@ static const unsigned int localPort = 2390;
 
 static const s_config DEFAULT_CONFIG =
 {
-magic          : 
-  MAGIC,
-  // coffee, coffee. 2nd coffee will be overwritten with randoms on 1st time power on.
-mac            : 
-  { 
-    0xC0, 0xFF, 0xEE, 0xC0, 0xFF, 0xEE  }
-  ,
-mode           : 
-  MODE_DHCP,
-retries        : 
-  4,
-timeoutPingS   : 
-  2, // seconds
-timeoutDhcpMs  : 
-  500, // ms
-waitTime       : 
-  10,
-pingAddr       : 
-  { 
-    10,2,0,1   }
-  ,
-timeServer     : 
-  { 
-    10,2,0,1   }
-  ,
-fetchTime      : 
-  true,
-timezone       :  
-  1,
-officeStart    :  
-  9,
-officeEnd      : 
-  19,
-officeEndFr    : 
-  17,
-fixedIp        : 
-  { 
-    0,0,0,0   }
-  ,
-syslogIP       : 
-  { 
-    10,2,0,21   }
-  ,
-httpIP         : 
-  { 
-    10,2,0,21   }
-  ,
-httpPort       : 
-  80,
-httpPath       : 
-  "/switch/log.php",
-lastReset      : 
-  { 
-isValid : 
-    0   }
-  ,
-lastReboot     : 
-  { 
-isValid : 
-    0   }
-  ,
-lastChange     : 
-  { 
-isValid : 
-    0   }
-  ,
-lastStart      : 
-  { 
-isValid : 
-    0   }
-  ,
-totalFailures  : 
-  0
+magic          :   MAGIC,  // coffee, coffee. 2nd coffee will be overwritten with randoms on 1st time power on.
+mac            :   { 0xC0, 0xFF, 0xEE, 0xC0, 0xFF, 0xEE },
+mode           :   MODE_DHCP,
+retries        :   4,
+timeoutPingS   :   2, // seconds
+timeoutDhcpMs  :   500, // ms
+waitTime       :   10,
+pingAddr       :   { 10, 2, 0, 1 },
+timeServer     :   { 10, 2, 0, 1 },
+fetchTime      :   true,
+timezone       :   1,
+officeStart    :   9,
+officeEnd      :   19,
+officeEndFr    :   17,
+fixedIp        :   {  0, 0, 0, 0 }  ,
+syslogIP       :   { 10, 2, 0,21 }  ,
+httpIP         :   { 10, 2, 0,21 }  ,
+httpPort       :   80,
+httpPath       :   "/switch/log.php",
+lastReset      :   { isValid : 0 },
+lastReboot     :   { isValid : 0 },
+lastChange     :   { isValid : 0 },
+lastStart      :   { isValid : 0 },
+totalFailures  :   0,
+doNightlyReset :   false  
 };
 
 static const int NTP_PACKET_SIZE =  48; // NTP time stamp is in the first 48 bytes of the message
@@ -364,6 +316,7 @@ static boolean showHelp()
     "H:S=9    office Start hour\r\n"
     "H:E=19   office End hour\r\n"
     "H:Y=17   same for fridaYs\r\n"
+    "H:@      toggle reset @ midnight\r\n"
 #endif
     "H:C      show Config\r\n"
     "H:G      show loGs\r\n"
@@ -572,6 +525,12 @@ static void handleCommand()
     else if ('G'==first)
     {
       valid = logs_show();
+    }
+    else if ('@'==first)
+    {
+      config.doNightlyReset = config.doNightlyReset ? false : true;
+      configSave(config.magic);
+      valid = true;
     }
 #ifdef WITH_NTP
     else if ('U'==first)
@@ -910,6 +869,9 @@ static boolean configDump()
   PPRINT(" (FR: "); 
   Serial.print(config.officeEndFr); 
   PPRINTLN(")");
+#endif
+#ifdef WITH_NTP
+  PPRINT("C:nightlyReset: "); Serial.println(config.doNightlyReset); 
 #endif
 #ifdef WITH_SYSLOG
   PPRINT("C:syslogIp:     "); 
@@ -1675,7 +1637,7 @@ void loop()
   }
 
 #ifdef WITH_NTP
-  if (config.fetchTime && time_loc.valid && time_loc.hours<1 && time_loc.minutes<15)
+  if (config.doNightlyReset && config.fetchTime && time_loc.valid && time_loc.hours<1 && time_loc.minutes<15)
   {
     if (!wasNightlyReset)
     {
@@ -1707,6 +1669,7 @@ void loop()
     mydelay(1000);
   }
 }
+
 
 
 

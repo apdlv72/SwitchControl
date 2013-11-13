@@ -99,3 +99,4 @@ void SyslogClass::logger(uint8_t facility, uint8_t severity, const char tag[], S
 /* Create one global object */
 SyslogClass Syslog;
 
+
